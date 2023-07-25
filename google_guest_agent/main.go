@@ -21,8 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -30,6 +28,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/events"
+	mdsEvent "github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/events/metadata"
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/events/sshtrustedca"
 	"github.com/GoogleCloudPlatform/guest-agent/metadata"
 	"github.com/GoogleCloudPlatform/guest-agent/utils"
 	"github.com/GoogleCloudPlatform/guest-logging-go/logger"
@@ -44,6 +45,7 @@ var (
 	config                   *ini.File
 	osRelease                release
 	action                   string
+	mdsClient                *metadata.Client
 )
 
 const (
@@ -131,8 +133,10 @@ func run(ctx context.Context) {
 		opts.Debug = true
 	}
 
+	mdsClient = metadata.New()
+
 	var err error
-	newMetadata, err = metadata.Get(ctx)
+	newMetadata, err = mdsClient.Get(ctx)
 	if err == nil {
 		opts.ProjectName = newMetadata.Project.ProjectID
 	}
@@ -161,39 +165,81 @@ func run(ctx context.Context) {
 
 	agentInit(ctx)
 
-	go func() {
-		oldMetadata = &metadata.Descriptor{}
-		webError := 0
-		for {
-			var err error
-			newMetadata, err = metadata.Watch(ctx)
-			if err != nil {
-				// Only log the second web error to avoid transient errors and
-				// not to spam the log on network failures.
-				if webError == 1 {
-					if urlErr, ok := err.(*url.Error); ok {
-						if _, ok := urlErr.Err.(*net.OpError); ok {
-							logger.Errorf("Network error when requesting metadata, make sure your instance has an active network and can reach the metadata server.")
-						}
-					}
-					logger.Errorf("Error watching metadata: %s", err)
-				}
-				webError++
-				time.Sleep(5 * time.Second)
-				continue
-			}
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			runUpdate()
-			oldMetadata = newMetadata
-			webError = 0
-		}
-	}()
+	eventsConfig := &events.Config{
+		Watchers: []string{
+			mdsEvent.WatcherID,
+		},
+	}
 
-	<-ctx.Done()
+	// Only Enable sshtrustedca Watcher if osLogin is enabled.
+	// TODO: ideally we should have a feature flag specifically for this.
+	osLoginEnabled, _, _ := getOSLoginEnabled(newMetadata)
+	if osLoginEnabled {
+		eventsConfig.Watchers = append(eventsConfig.Watchers, sshtrustedca.WatcherID)
+	}
+
+	eventManager, err := events.New(eventsConfig)
+	if err != nil {
+		logger.Errorf("Error initializing event manager: %v", err)
+		return
+	}
+
+	var cachedCertificate string
+	eventManager.Subscribe(sshtrustedca.ReadEvent, nil, func(evType string, data interface{}, evData *events.EventData) bool {
+		// There was some error on the pipe watcher, just ignore it.
+		if evData.Error != nil {
+			logger.Debugf("Not handling ssh trusted ca cert event, we got an error: %+v", evData.Error)
+			return true
+		}
+
+		// Make sure we close the pipe after we've done writing to it.
+		pipeData := evData.Data.(*sshtrustedca.PipeData)
+		defer pipeData.File.Close()
+
+		// The certificates key/endpoint is not cached, we can't rely on the metadata watcher data because of that.
+		certificate, err := mdsClient.GetKey(ctx, "oslogin/certificates")
+		if err != nil && cachedCertificate != "" {
+			certificate = cachedCertificate
+			logger.Warningf("Failed to get certificate, assuming/using previously cached one.")
+		} else if err != nil {
+			logger.Errorf("Failed to get certificate from metadata server: %+v", err)
+			return true
+		}
+
+		// Keep a copy of the returned certificate for error fallback caching.
+		cachedCertificate = certificate
+
+		n, err := pipeData.File.WriteString(certificate)
+		if err != nil {
+			logger.Errorf("Failed to write certificate to the write end of the pipe: %+v", err)
+		}
+
+		if n != len(certificate) {
+			logger.Errorf("Wrote the wrong ammout of data, wrote %d bytes instead of %d bytes", n, len(certificate))
+		}
+
+		return true
+	})
+
+	oldMetadata = &metadata.Descriptor{}
+	eventManager.Subscribe(mdsEvent.LongpollEvent, nil, func(evType string, data interface{}, evData *events.EventData) bool {
+		logger.Debugf("Handling metadata %q event.", evType)
+
+		// If metadata watcher failed there isn't much we can do, just ignore the event and
+		// allow the water to get it corrected.
+		if evData.Error != nil {
+			logger.Infof("Metadata event watcher failed, ignoring: %+v", evData.Error)
+			return true
+		}
+
+		newMetadata = evData.Data.(*metadata.Descriptor)
+		runUpdate()
+		oldMetadata = newMetadata
+
+		return true
+	})
+
+	eventManager.Run(ctx)
 	logger.Infof("GCE Agent Stopped")
 }
 
