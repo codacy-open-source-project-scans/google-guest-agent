@@ -12,21 +12,23 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-// Package uefi provides utility functions to read UEFI variables.
-package uefi
+syntax = "proto3";
 
-// VariableName represents UEFI variable name and GUID.
-// Format: {VariableName}-{VendorGUID}
-type VariableName struct {
-	RootDir string
-	Name    string
-	GUID    string
+package telemetry;
+
+option go_package = "google_guest_agent/telemetry";
+
+message OSInfo {
+  optional string os_type = 1;
+  optional string long_name = 2;
+  optional string short_name = 3;
+  optional string version = 4;
+  optional string kernel_version = 5;
+  optional string kernel_release = 6;
 }
 
-// Variable represents UEFI Variable and its contents.
-// Attributes are not set in case of Windows.
-type Variable struct {
-	Name       VariableName
-	Attributes []byte
-	Content    []byte
+message AgentInfo {
+  optional string name = 1;
+  optional string version = 2;
+  optional string architecture = 3;
 }

@@ -82,7 +82,7 @@ func (o *osloginMgr) disabled(os string) bool {
 	return os == "windows"
 }
 
-func (o *osloginMgr) set() error {
+func (o *osloginMgr) set(ctx context.Context) error {
 	// We need to know if it was previously enabled for the clearing of
 	// metadata-based SSH keys.
 	oldEnable, _, _ := getOSLoginEnabled(oldMetadata)
@@ -92,7 +92,7 @@ func (o *osloginMgr) set() error {
 		logger.Infof("Enabling OS Login")
 		newMetadata.Instance.Attributes.SSHKeys = nil
 		newMetadata.Project.Attributes.SSHKeys = nil
-		(&accountsMgr{}).set()
+		(&accountsMgr{}).set(ctx)
 	}
 
 	if !enable && oldEnable {
@@ -132,7 +132,7 @@ func (o *osloginMgr) set() error {
 	}
 
 	now := fmt.Sprintf("%d", time.Now().Unix())
-	mdsClient.WriteGuestAttributes(context.Background(), "guest-agent/sshable", now)
+	mdsClient.WriteGuestAttributes(ctx, "guest-agent/sshable", now)
 
 	if enable {
 		logger.Debugf("Create OS Login dirs, if needed")
@@ -206,7 +206,7 @@ func updateSSHConfig(sshConfig string, enable, twofactor, skey bool) string {
 	trustedUserCAKeys := "TrustedUserCAKeys " + sshtrustedca.DefaultPipePath
 
 	twoFactorAuthMethods := "AuthenticationMethods publickey,keyboard-interactive"
-	if (osRelease.os == "rhel" || osRelease.os == "centos") && osRelease.version.major == 6 {
+	if (osInfo.OS == "rhel" || osInfo.OS == "centos") && osInfo.Version.Major == 6 {
 		authorizedKeysUser = "AuthorizedKeysCommandRunAs root"
 		twoFactorAuthMethods = "RequiredAuthentications2 publickey,keyboard-interactive"
 	}

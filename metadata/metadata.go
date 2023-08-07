@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -31,13 +32,39 @@ import (
 const (
 	defaultMetadataURL = "http://169.254.169.254/computeMetadata/v1/"
 	defaultEtag        = "NONE"
-	metadataRecursive  = "/?recursive=true&alt=json"
-	metadataHang       = "&wait_for_change=true&timeout_sec=60"
+
+	// defaultHangtimeout is the timeout parameter passed to metadata as the hang timeout.
+	defaultHangTimeout = 60
+
+	// defaultClientTimeout sets the http.Client time out, the delta of 10s between the
+	// defaultHangTimeout and client timeout should be enough to avoid canceling the context
+	// before headers and body are read.
+	defaultClientTimeout = 70
 )
 
 var (
-	defaultTimeout = 70 * time.Second
+	// we backoff until 10s
+	backoffDuration = 100 * time.Millisecond
+	backoffAttempts = 100
 )
+
+// MDSClientInterface is the minimum required Metadata Server interface for Guest Agent.
+type MDSClientInterface interface {
+	Get(context.Context) (*Descriptor, error)
+	GetKey(context.Context, string, map[string]string) (string, error)
+	Watch(context.Context) (*Descriptor, error)
+	WriteGuestAttributes(context.Context, string, string) error
+}
+
+// requestConfig is used internally to configure an http request given its context.
+type requestConfig struct {
+	baseURL    string
+	hang       bool
+	recursive  bool
+	jsonOutput bool
+	timeout    int
+	headers    map[string]string
+}
 
 // Client defines the public interface between the core guest agent and
 // the metadata layer.
@@ -53,7 +80,7 @@ func New() *Client {
 		metadataURL: defaultMetadataURL,
 		etag:        defaultEtag,
 		httpClient: &http.Client{
-			Timeout: defaultTimeout,
+			Timeout: defaultClientTimeout * time.Second,
 		},
 	}
 }
@@ -145,6 +172,7 @@ type Attributes struct {
 	EnableWSFC            *bool
 	WSFCAddresses         string
 	WSFCAgentPort         string
+	DisableTelemetry      bool
 }
 
 // UnmarshalJSON unmarshals b into Attribute.
@@ -171,6 +199,7 @@ func (a *Attributes) UnmarshalJSON(b []byte) error {
 		WindowsKeys           WindowsKeys `json:"windows-keys"`
 		WSFCAddresses         string      `json:"wsfc-addrs"`
 		WSFCAgentPort         string      `json:"wsfc-agent-port"`
+		DisableTelemetry      string      `json:"disable-guest-telemetry"`
 	}
 	var temp inner
 	if err := json.Unmarshal(b, &temp); err != nil {
@@ -217,6 +246,13 @@ func (a *Attributes) UnmarshalJSON(b []byte) error {
 	if err == nil {
 		a.SecurityKey = mkbool(value)
 	}
+	value, err = strconv.ParseBool(temp.DisableTelemetry)
+	if err == nil {
+		a.DisableTelemetry = value
+	} else {
+		// Telemetry defaults to disabled.
+		a.DisableTelemetry = true
+	}
 	// So SSHKeys will be nil instead of []string{}
 	if temp.SSHKeys != "" {
 		a.SSHKeys = strings.Split(temp.SSHKeys, "\n")
@@ -237,6 +273,45 @@ func (c *Client) updateEtag(resp *http.Response) bool {
 	return c.etag != oldEtag
 }
 
+func (c *Client) retry(ctx context.Context, cfg requestConfig) (string, error) {
+	for i := 1; i <= backoffAttempts; i++ {
+		resp, err := c.do(ctx, cfg)
+
+		// If the context was canceled just return the error and don't retry.
+		if err != nil && errors.Is(err, context.Canceled) {
+			return "", err
+		}
+
+		// Apply the backoff strategy.
+		if err != nil {
+			logger.Errorf("Failed to connect to metadata server: %+v", err)
+			time.Sleep(time.Duration(i) * backoffDuration)
+			continue
+		}
+
+		return resp, nil
+	}
+	return "", fmt.Errorf("reached max attempts to connect to metadata")
+}
+
+// GetKey gets a specific metadata key.
+func (c *Client) GetKey(ctx context.Context, key string, headers map[string]string) (string, error) {
+	// url.JoinPath first exists in go 1.19
+	key = strings.TrimPrefix(key, "/")
+	var reqURL string
+	if strings.HasSuffix(c.metadataURL, "/") {
+		reqURL = c.metadataURL + key
+	} else {
+		reqURL = c.metadataURL + "/" + key
+	}
+
+	cfg := requestConfig{
+		baseURL: reqURL,
+		headers: headers,
+	}
+	return c.retry(ctx, cfg)
+}
+
 // Watch runs a longpoll on metadata server.
 func (c *Client) Watch(ctx context.Context) (*Descriptor, error) {
 	return c.get(ctx, true)
@@ -248,41 +323,28 @@ func (c *Client) Get(ctx context.Context) (*Descriptor, error) {
 }
 
 func (c *Client) get(ctx context.Context, hang bool) (*Descriptor, error) {
-	logger.Debugf("Invoking Get metadata, wait for change: %t", hang)
-	finalURL := c.metadataURL + metadataRecursive
+	cfg := requestConfig{
+		baseURL:    c.metadataURL,
+		timeout:    defaultHangTimeout,
+		recursive:  true,
+		jsonOutput: true,
+	}
+
 	if hang {
-		finalURL += metadataHang
+		cfg.hang = true
 	}
-	finalURL += ("&last_etag=" + c.etag)
 
-	req, err := http.NewRequest("GET", finalURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Add("Metadata-Flavor", "Google")
-	req = req.WithContext(ctx)
-
-	resp, err := c.httpClient.Do(req)
-	// Don't return error on a canceled context.
-	if err != nil && ctx.Err() != nil {
-		return nil, nil
-	}
+	resp, err := c.retry(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	// We return the response even if the etag has not been updated.
-	if hang {
-		c.updateEtag(resp)
-	}
-
-	md, err := ioutil.ReadAll(resp.Body)
-	resp.Body.Close()
-	if err != nil {
-		return nil, err
-	}
 	var ret Descriptor
-	return &ret, json.Unmarshal(md, &ret)
+	if err = json.Unmarshal([]byte(resp), &ret); err != nil {
+		return nil, err
+	}
+
+	return &ret, nil
 }
 
 // WriteGuestAttributes does a put call to mds changing a guest attribute value.
@@ -301,30 +363,68 @@ func (c *Client) WriteGuestAttributes(ctx context.Context, key, value string) er
 	return err
 }
 
-// GetKey gets a specific metadata key.
-func (c *Client) GetKey(ctx context.Context, key string) (string, error) {
-	req, err := http.NewRequest("GET", c.metadataURL+key, nil)
+func (c *Client) do(ctx context.Context, cfg requestConfig) (string, error) {
+	var (
+		urlTokens []string
+		finalURL  string
+	)
+
+	if cfg.hang {
+		urlTokens = append(urlTokens, "wait_for_change=true")
+		urlTokens = append(urlTokens, "last_etag="+c.etag)
+	}
+
+	if cfg.timeout > 0 {
+		urlTokens = append(urlTokens, fmt.Sprintf("timeout_sec=%d", cfg.timeout))
+	}
+
+	if cfg.recursive {
+		urlTokens = append(urlTokens, "recursive=true")
+	}
+
+	if cfg.jsonOutput {
+		urlTokens = append(urlTokens, "alt=json")
+	}
+
+	finalURL = cfg.baseURL
+
+	if len(urlTokens) > 0 {
+		finalURL = fmt.Sprintf("%s/?%s", finalURL, strings.Join(urlTokens, "&"))
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", finalURL, nil)
 	if err != nil {
 		return "", err
 	}
 
 	req.Header.Add("Metadata-Flavor", "Google")
-	req = req.WithContext(ctx)
+	for k, v := range cfg.headers {
+		req.Header.Add(k, v)
+	}
+	resp, err := c.httpClient.Do(req)
 
-	res, err := c.httpClient.Do(req)
-	if err == nil {
-		// TODO: Expand and propagate this error handling to the other metadata operations.
-		errorMsgFmt := "error connecting to metadata server, status code: %d"
-		switch res.StatusCode {
-		case 404, 412:
-			return "", fmt.Errorf(errorMsgFmt, res.StatusCode)
-		}
-	} else if err != nil {
+	// If we are canceling httpClient will also wrap the context's error so
+	// check first the context.
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+
+	if err != nil {
 		return "", fmt.Errorf("error connecting to metadata server: %+v", err)
 	}
 
-	defer res.Body.Close()
-	md, err := ioutil.ReadAll(res.Body)
+	statusCodeMsg := "error connecting to metadata server, status code: %d"
+	switch resp.StatusCode {
+	case 404, 412:
+		return "", fmt.Errorf(statusCodeMsg, resp.StatusCode)
+	}
+
+	if cfg.hang {
+		c.updateEtag(resp)
+	}
+
+	defer resp.Body.Close()
+	md, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("error reading metadata response data: %+v", err)
 	}

@@ -18,18 +18,67 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"os"
+
+	"github.com/google/tink/go/aead/subtle"
 )
 
-// VerifyCertificate validates certificate is in valid PEM format.
-func VerifyCertificate(cert []byte) error {
+// parseCertificate validates certificate is in valid PEM format.
+func parseCertificate(cert []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(cert)
 	if block == nil {
-		return fmt.Errorf("failed to parse PEM certificate")
+		return nil, fmt.Errorf("failed to parse PEM certificate")
 	}
 
-	if _, err := x509.ParseCertificate(block.Bytes); err != nil {
-		return fmt.Errorf("failed to parse certificate: %w", err)
+	x509Cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate: %w", err)
+	}
+
+	return x509Cert, nil
+}
+
+// verifySign verifies the client certificate is valid and signed by root CA.
+func verifySign(cert []byte, rootCAFile string) error {
+	caCertPEM, err := os.ReadFile(rootCAFile)
+	if err != nil {
+		return fmt.Errorf("failed to read CA PEM file for verifying signature: %w", err)
+	}
+
+	x509Cert, err := parseCertificate(cert)
+	if err != nil {
+		return fmt.Errorf("failed to parse client certificate for verifying signature: %w", err)
+	}
+
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(caCertPEM)
+
+	opts := x509.VerifyOptions{
+		Roots:     roots,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+
+	if _, err := x509Cert.Verify(opts); err != nil {
+		return fmt.Errorf("failed to verify if client certificate against root CA %q: %w", rootCAFile, err)
 	}
 
 	return nil
+}
+
+// encrypt encrypts plain text using AES GCM algorithm.
+func encrypt(aesKey []byte, plainText []byte, associatedData []byte) ([]byte, error) {
+	cipher, err := subtle.NewAESGCM(aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize cipher: %v", err)
+	}
+	return cipher.Encrypt(plainText, associatedData)
+}
+
+// decrypt decrypts AES GCM encrypted cipher text.
+func decrypt(aesKey []byte, cipherText []byte, associatedData []byte) ([]byte, error) {
+	cipher, err := subtle.NewAESGCM(aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize cipher: %v", err)
+	}
+	return cipher.Decrypt(cipherText, associatedData)
 }

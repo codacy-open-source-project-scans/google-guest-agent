@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -283,7 +284,7 @@ func (a *addressMgr) disabled(os string) (disabled bool) {
 	return !config.Section("Daemons").Key("network_daemon").MustBool(true)
 }
 
-func (a *addressMgr) set() error {
+func (a *addressMgr) set(ctx context.Context) error {
 	if runtime.GOOS == "windows" {
 		a.applyWSFCFilter()
 	}
@@ -539,9 +540,9 @@ func enableNetworkInterfaces() error {
 	}
 
 	switch {
-	case osRelease.os == "sles":
+	case osInfo.OS == "sles":
 		return enableSLESInterfaces(googleInterfaces)
-	case (osRelease.os == "rhel" || osRelease.os == "centos") && osRelease.version.major >= 7:
+	case (osInfo.OS == "rhel" || osInfo.OS == "centos") && osInfo.Version.Major >= 7:
 		for _, iface := range googleInterfaces {
 			err := disableNM(iface)
 			if err != nil {
