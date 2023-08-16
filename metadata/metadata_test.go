@@ -57,7 +57,7 @@ func TestWatchMetadata(t *testing.T) {
 			WindowsKey{Exponent: "exponent", UserName: "username", Modulus: "modulus", ExpireOn: et, AddToAdministrators: func() *bool { ret := true; return &ret }()},
 		},
 		SSHKeys:          []string{"name:ssh-rsa [KEY] hostname", "name:ssh-rsa [KEY] hostname"},
-		DisableTelemetry: true,
+		DisableTelemetry: false,
 	}
 	for _, e := range []string{etag1, etag2} {
 		got, err := client.Watch(context.Background())
@@ -139,5 +139,48 @@ func TestGetKey(t *testing.T) {
 	}
 	if gotReqURI != wantURI {
 		t.Errorf("did not get expected request uri, got :%q, want: %q", gotReqURI, wantURI)
+	}
+}
+
+func TestShouldRetry(t *testing.T) {
+
+	tests := []struct {
+		desc string
+		resp *http.Response
+		err  error
+		want bool
+	}{
+		{
+			desc: "404_should_not_retry",
+			resp: &http.Response{StatusCode: 404},
+			want: false,
+			err:  nil,
+		},
+		{
+			desc: "429_should_retry",
+			resp: &http.Response{StatusCode: 429},
+			want: true,
+			err:  nil,
+		},
+		{
+			desc: "ctx_canceled_should_not_retry",
+			resp: &http.Response{StatusCode: 200},
+			want: false,
+			err:  context.Canceled,
+		},
+		{
+			desc: "random_err_should_retry",
+			resp: &http.Response{StatusCode: 200},
+			want: true,
+			err:  fmt.Errorf("fake retriable error"),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			if got := shouldRetry(test.resp, test.err); got != test.want {
+				t.Errorf("shouldRetry(%+v, %+v) = %t, want %t", test.resp, test.err, got, test.want)
+			}
+		})
 	}
 }

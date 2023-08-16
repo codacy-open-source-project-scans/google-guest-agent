@@ -18,15 +18,48 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"path"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/GoogleCloudPlatform/guest-logging-go/logger"
 )
 
+const (
+	// localFileContext is the path to the SELinux' local context matching rules.
+	localFileContext = "/etc/selinux/targeted/contexts/files/file_contexts.local"
+)
+
+// Create selinux file context if not yet set, returns true if restorecon must be executed.
+func configureSELinux(pipePath string) (bool, error) {
+	if _, err := os.Stat(path.Dir(pipePath)); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	data, err := os.ReadFile(localFileContext)
+	if err != nil {
+		return false, err
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, pipePath) {
+			logger.Debugf("SELinux is configured for sshca pipe: %s", pipePath)
+			return true, nil
+		}
+	}
+
+	conf := fmt.Sprintf("\n%s  -p system_u:object_r:sshd_key_t:s0\n", pipePath)
+	return true, os.WriteFile(localFileContext, []byte(string(data)+conf), 0644)
+}
+
 // Create a named pipe if it doesn't exist.
-func createNamedPipe(pipePath string) error {
+func createNamedPipe(pipePath string, configSELinux bool) error {
 	pipeDir := filepath.Dir(pipePath)
 	_, err := os.Stat(pipeDir)
 
@@ -41,6 +74,23 @@ func createNamedPipe(pipePath string) error {
 		if os.IsNotExist(err) {
 			if err := syscall.Mkfifo(pipePath, 0644); err != nil {
 				return fmt.Errorf("failed to create named pipe: %+v", err)
+			}
+
+			if configSELinux {
+				hasFileContext, err := configureSELinux(pipePath)
+				if err != nil {
+					return fmt.Errorf("failed to configure SELinux: %+v", err)
+				}
+
+				if hasFileContext {
+					// Try to setup selinux context if available.
+					restorecon, err := exec.LookPath("restorecon")
+					if err == nil {
+						if err := exec.Command(restorecon, "-F", pipePath).Run(); err != nil {
+							return fmt.Errorf("failed to setup selinux context: %+v", err)
+						}
+					}
+				}
 			}
 		} else {
 			return fmt.Errorf("failed to stat file: " + pipePath)
@@ -68,7 +118,7 @@ func (mp *Watcher) setWaitingWrite(val bool) {
 }
 
 // Run listens to ssh_trusted_ca's pipe open calls and report back the event.
-func (mp *Watcher) Run(ctx context.Context) (bool, string, interface{}, error) {
+func (mp *Watcher) Run(ctx context.Context, evType string) (bool, interface{}, error) {
 	var canceled bool
 
 	for mp.isWaitingWrite() {
@@ -105,15 +155,15 @@ func (mp *Watcher) Run(ctx context.Context) (bool, string, interface{}, error) {
 
 	// If the configured named pipe doesn't exists we create it before emitting events
 	// from it.
-	if err := createNamedPipe(mp.pipePath); err != nil {
-		return true, ReadEvent, nil, err
+	if err := createNamedPipe(mp.pipePath, mp.configSELinux); err != nil {
+		return true, nil, err
 	}
 
 	// Open the pipe as writeonly, it will block until a read is performed from the
 	// other end of the pipe.
 	pipeFile, err := os.OpenFile(mp.pipePath, os.O_WRONLY, 0644)
 	if err != nil {
-		return true, ReadEvent, nil, err
+		return true, nil, err
 	}
 
 	// Have we got a ctx.Done()? if so lets just return from here and unregister
@@ -122,11 +172,11 @@ func (mp *Watcher) Run(ctx context.Context) (bool, string, interface{}, error) {
 		if err := pipeFile.Close(); err != nil {
 			logger.Errorf("Failed to close readonly pipe: %+v", err)
 		}
-		return false, ReadEvent, nil, nil
+		return false, nil, nil
 	}
 
 	cancelContext <- true
 	mp.setWaitingWrite(true)
 
-	return true, ReadEvent, &PipeData{File: pipeFile, Finished: mp.finishedCb}, nil
+	return true, &PipeData{File: pipeFile, Finished: mp.finishedCb}, nil
 }

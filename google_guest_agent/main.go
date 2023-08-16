@@ -28,10 +28,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/agentcrypto"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/events"
 	mdsEvent "github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/events/metadata"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/events/sshtrustedca"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/osinfo"
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/scheduler"
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/sshca"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/telemetry"
 	"github.com/GoogleCloudPlatform/guest-agent/metadata"
 	"github.com/GoogleCloudPlatform/guest-agent/utils"
@@ -39,13 +42,22 @@ import (
 	"github.com/go-ini/ini"
 )
 
+// Certificates wrapps a list of certificate authorities.
+type Certificates struct {
+	Certs []TrustedCert `json:"trustedCertificateAuthorities"`
+}
+
+// TrustedCert defines the object containing a public key.
+type TrustedCert struct {
+	PublicKey string `json:"publicKey"`
+}
+
 var (
 	programName              = "GCEGuestAgent"
 	version                  string
 	oldMetadata, newMetadata *metadata.Descriptor
 	config                   *ini.File
 	osInfo                   osinfo.OSInfo
-	action                   string
 	mdsClient                *metadata.Client
 )
 
@@ -177,23 +189,17 @@ func run(ctx context.Context) {
 		}
 	}
 
-	// Only record telemetry if we have metdata, and telemetry isnt disabled.
-	// Telemetry should onlyt be recorded once in an agents lifetime and is done on a best effort basis.
-	if newMetadata != nil && !newMetadata.Instance.Attributes.DisableTelemetry && !newMetadata.Project.Attributes.DisableTelemetry {
-		d := telemetry.Data{
-			AgentName:     programName,
-			AgentVersion:  version,
-			AgentArch:     runtime.GOARCH,
-			OS:            runtime.GOOS,
-			LongName:      osInfo.PrettyName,
-			ShortName:     osInfo.OS,
-			Version:       osInfo.VersionID,
-			KernelRelease: osInfo.KernelRelease,
-			KernelVersion: osInfo.KernelVersion,
-		}
-		if err := telemetry.Record(ctx, mdsClient, d); err != nil {
-			logger.Debugf("Error recording telemetry: %v", err)
-		}
+	// knownJobs is list of default jobs that run on a pre-defined schedule.
+	knownJobs := []scheduler.Job{agentcrypto.New(), telemetry.New(mdsClient, programName, version)}
+	sched := scheduler.Get()
+	for _, job := range knownJobs {
+		go func(job scheduler.Job) {
+			if err := sched.ScheduleJob(ctx, job); err != nil {
+				logger.Errorf("Failed to schedule job %s with error: %v", job.ID(), err)
+			} else {
+				logger.Infof("Successfully scheduled job %s", job.ID())
+			}
+		}(job)
 	}
 
 	eventsConfig := &events.Config{
@@ -215,50 +221,10 @@ func run(ctx context.Context) {
 		return
 	}
 
-	var cachedCertificate string
-	eventManager.Subscribe(sshtrustedca.ReadEvent, nil, func(evType string, data interface{}, evData *events.EventData) bool {
-		// There was some error on the pipe watcher, just ignore it.
-		if evData.Error != nil {
-			logger.Debugf("Not handling ssh trusted ca cert event, we got an error: %+v", evData.Error)
-			return true
-		}
-
-		// Make sure we close the pipe after we've done writing to it.
-		pipeData := evData.Data.(*sshtrustedca.PipeData)
-		defer func() {
-			if err := pipeData.File.Close(); err != nil {
-				logger.Errorf("Failed to close pipe: %+v", err)
-			}
-			pipeData.Finished()
-		}()
-
-		// The certificates key/endpoint is not cached, we can't rely on the metadata watcher data because of that.
-		certificate, err := mdsClient.GetKey(ctx, "oslogin/certificates", nil)
-		if err != nil && cachedCertificate != "" {
-			certificate = cachedCertificate
-			logger.Warningf("Failed to get certificate, assuming/using previously cached one.")
-		} else if err != nil {
-			logger.Errorf("Failed to get certificate from metadata server: %+v", err)
-			return true
-		}
-
-		// Keep a copy of the returned certificate for error fallback caching.
-		cachedCertificate = certificate
-
-		n, err := pipeData.File.WriteString(certificate)
-		if err != nil {
-			logger.Errorf("Failed to write certificate to the write end of the pipe: %+v", err)
-		}
-
-		if n != len(certificate) {
-			logger.Errorf("Wrote the wrong ammout of data, wrote %d bytes instead of %d bytes", n, len(certificate))
-		}
-
-		return true
-	})
+	sshca.Init(eventManager)
 
 	oldMetadata = &metadata.Descriptor{}
-	eventManager.Subscribe(mdsEvent.LongpollEvent, nil, func(evType string, data interface{}, evData *events.EventData) bool {
+	eventManager.Subscribe(mdsEvent.LongpollEvent, nil, func(ctx context.Context, evType string, data interface{}, evData *events.EventData) bool {
 		logger.Debugf("Handling metadata %q event.", evType)
 
 		// If metadata watcher failed there isn't much we can do, just ignore the event and
@@ -333,8 +299,8 @@ func runCmdOutput(cmd *exec.Cmd) *execResult {
 	return &execResult{code: 0, out: stdout.String()}
 }
 
-func runCmdOutputWithTimeout(timeoutSec time.Duration, name string, args ...string) *execResult {
-	ctx, cancel := context.WithTimeout(context.Background(), timeoutSec)
+func runCmdOutputWithTimeout(timeout time.Duration, name string, args ...string) *execResult {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	execResult := runCmdOutput(exec.CommandContext(ctx, name, args...))
 	if ctx.Err() != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {

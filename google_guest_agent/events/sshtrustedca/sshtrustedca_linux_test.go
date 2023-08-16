@@ -28,7 +28,7 @@ func TestPipe(t *testing.T) {
 	// Putting a directory name between temp dir and the file name guarantees we test
 	// the directory creation.
 	pipePath := path.Join(t.TempDir(), "ssh", "oslogin_trustedca.pub")
-	watcher := New(pipePath)
+	watcher := New(pipePath, false)
 	testData := "test data transmited through the pipe."
 
 	if watcher.ID() != WatcherID {
@@ -77,7 +77,7 @@ func TestPipe(t *testing.T) {
 		}
 	}()
 
-	_, _, evData, err := watcher.Run(context.Background())
+	_, evData, err := watcher.Run(context.Background(), ReadEvent)
 	if err != nil {
 		t.Fatalf("Watcher failed: %+v", err)
 	}
@@ -95,7 +95,7 @@ func TestPipe(t *testing.T) {
 
 func TestCancel(t *testing.T) {
 	pipePath := path.Join(t.TempDir(), "ssh", "oslogin_trustedca.pub")
-	watcher := New(pipePath)
+	watcher := New(pipePath, false)
 
 	sync := make(chan bool)
 	defer close(sync)
@@ -119,5 +119,5 @@ func TestCancel(t *testing.T) {
 		}
 	}()
 
-	watcher.Run(ctx)
+	watcher.Run(ctx, ReadEvent)
 }
