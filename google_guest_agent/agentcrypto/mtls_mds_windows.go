@@ -15,6 +15,7 @@
 package agentcrypto
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
@@ -38,8 +39,6 @@ const (
 	clientCredsFileName = "mds-mtls-client.key"
 	// pfxFile stores client credentials in PFX format.
 	pfxFile = "mds-mtls-client.key.pfx"
-	// cryptExportable (CRYPT_EXPORTABLE) is used to mark imported as keys as exportable.
-	cryptExportable = 0x00000001
 	// https://learn.microsoft.com/en-us/windows/win32/seccrypto/system-store-locations
 	// my is predefined personal cert store.
 	my = "MY"
@@ -59,7 +58,7 @@ var (
 )
 
 // writeRootCACert writes Root CA cert from UEFI variable to output file.
-func (j *CredsJob) writeRootCACert(cacert []byte, outputFile string) error {
+func (j *CredsJob) writeRootCACert(_ context.Context, cacert []byte, outputFile string) error {
 	if err := utils.SaferWriteFile(cacert, outputFile); err != nil {
 		return err
 	}
@@ -171,7 +170,7 @@ func (j *CredsJob) writeClientCredentials(creds []byte, outputFile string) error
 	}
 
 	// https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-pfximportcertstore
-	handle, err := windows.PFXImportCertStore(&blob, syscall.StringToUTF16Ptr(""), uint32(cryptExportable))
+	handle, err := windows.PFXImportCertStore(&blob, syscall.StringToUTF16Ptr(""), windows.CRYPT_MACHINE_KEYSET)
 	if err != nil {
 		return fmt.Errorf("failed to import PFX in cert store: %w", err)
 	}

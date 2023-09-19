@@ -25,13 +25,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/agentcrypto"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/events"
 	mdsEvent "github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/events/metadata"
-	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/events/sshtrustedca"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/osinfo"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/scheduler"
-	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/sshca"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/telemetry"
 	"github.com/GoogleCloudPlatform/guest-agent/metadata"
 	"github.com/GoogleCloudPlatform/guest-agent/utils"
@@ -187,17 +184,8 @@ func runAgent(ctx context.Context) {
 	}
 
 	// knownJobs is list of default jobs that run on a pre-defined schedule.
-	knownJobs := []scheduler.Job{agentcrypto.New(), telemetry.New(mdsClient, programName, version)}
-	sched := scheduler.Get()
-	for _, job := range knownJobs {
-		go func(job scheduler.Job) {
-			if err := sched.ScheduleJob(ctx, job); err != nil {
-				logger.Errorf("Failed to schedule job %s with error: %v", job.ID(), err)
-			} else {
-				logger.Infof("Successfully scheduled job %s", job.ID())
-			}
-		}(job)
-	}
+	knownJobs := []scheduler.Job{telemetry.New(mdsClient, programName, version)}
+	scheduler.ScheduleJobs(ctx, knownJobs, false)
 
 	eventsConfig := &events.Config{
 		Watchers: []string{
@@ -205,20 +193,11 @@ func runAgent(ctx context.Context) {
 		},
 	}
 
-	// Only Enable sshtrustedca Watcher if osLogin is enabled.
-	// TODO: ideally we should have a feature flag specifically for this.
-	osLoginEnabled, _, _ := getOSLoginEnabled(newMetadata)
-	if osLoginEnabled {
-		eventsConfig.Watchers = append(eventsConfig.Watchers, sshtrustedca.WatcherID)
-	}
-
 	eventManager, err := events.New(eventsConfig)
 	if err != nil {
 		logger.Errorf("Error initializing event manager: %v", err)
 		return
 	}
-
-	sshca.Init(eventManager)
 
 	oldMetadata = &metadata.Descriptor{}
 	eventManager.Subscribe(mdsEvent.LongpollEvent, nil, func(ctx context.Context, evType string, data interface{}, evData *events.EventData) bool {

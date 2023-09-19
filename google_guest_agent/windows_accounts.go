@@ -114,7 +114,7 @@ func printCreds(creds *credsJSON) error {
 	return err
 }
 
-func createOrResetPwd(k metadata.WindowsKey) (*credsJSON, error) {
+func createOrResetPwd(ctx context.Context, k metadata.WindowsKey) (*credsJSON, error) {
 	pwd, err := newPwd(k.PasswordLength)
 	if err != nil {
 		return nil, fmt.Errorf("error creating password: %v", err)
@@ -124,18 +124,18 @@ func createOrResetPwd(k metadata.WindowsKey) (*credsJSON, error) {
 		if err := resetPwd(k.UserName, pwd); err != nil {
 			return nil, fmt.Errorf("error running resetPwd: %v", err)
 		}
-		if k.AddToAdministrators != nil && *k.AddToAdministrators == true {
-			if err := addUserToGroup(k.UserName, "Administrators"); err != nil {
+		if k.AddToAdministrators != nil && *k.AddToAdministrators {
+			if err := addUserToGroup(ctx, k.UserName, "Administrators"); err != nil {
 				return nil, fmt.Errorf("error running addUserToGroup: %v", err)
 			}
 		}
 	} else {
 		logger.Infof("Creating user %s", k.UserName)
-		if err := createUser(k.UserName, pwd); err != nil {
+		if err := createUser(ctx, k.UserName, pwd); err != nil {
 			return nil, fmt.Errorf("error running createUser: %v", err)
 		}
-		if k.AddToAdministrators == nil || *k.AddToAdministrators == true {
-			if err := addUserToGroup(k.UserName, "Administrators"); err != nil {
+		if k.AddToAdministrators == nil || *k.AddToAdministrators {
+			if err := addUserToGroup(ctx, k.UserName, "Administrators"); err != nil {
 				return nil, fmt.Errorf("error running addUserToGroup: %v", err)
 			}
 		}
@@ -144,7 +144,7 @@ func createOrResetPwd(k metadata.WindowsKey) (*credsJSON, error) {
 	return createcredsJSON(k, pwd)
 }
 
-func createSSHUser(user string) error {
+func createSSHUser(ctx context.Context, user string) error {
 	pwd, err := newPwd(20)
 	if err != nil {
 		return fmt.Errorf("error creating password: %v", err)
@@ -153,11 +153,11 @@ func createSSHUser(user string) error {
 		return nil
 	}
 	logger.Infof("Creating user %s", user)
-	if err := createUser(user, pwd); err != nil {
+	if err := createUser(ctx, user, pwd); err != nil {
 		return fmt.Errorf("error running createUser: %v", err)
 	}
 
-	if err := addUserToGroup(user, "Administrators"); err != nil {
+	if err := addUserToGroup(ctx, user, "Administrators"); err != nil {
 		return fmt.Errorf("error running addUserToGroup: %v", err)
 	}
 	return nil
@@ -282,7 +282,7 @@ func parseVersionInfo(psOutput []byte) (versionInfo, error) {
 	splitVer := strings.Split(verStr, ".")
 
 	if len(splitVer) < 2 {
-		return verInfo, fmt.Errorf("Cannot parse OpenSSH version string: %v", verStr)
+		return verInfo, fmt.Errorf("cannot parse OpenSSH version string: %v", verStr)
 	}
 
 	majorVer, err := strconv.Atoi(splitVer[0])
@@ -301,7 +301,7 @@ func parseVersionInfo(psOutput []byte) (versionInfo, error) {
 }
 
 func versionOk(checkVersion versionInfo, minVersion versionInfo) error {
-	versionError := fmt.Errorf("Detected OpenSSH version may be incompatible with enable_windows_ssh. Found version %s, Need Version: %s", checkVersion, minVersion)
+	versionError := fmt.Errorf("detected OpenSSH version may be incompatible with enable_windows_ssh. Found version %s, Need Version: %s", checkVersion, minVersion)
 
 	if checkVersion.major < minVersion.major {
 		return versionError
@@ -314,15 +314,15 @@ func versionOk(checkVersion versionInfo, minVersion versionInfo) error {
 	return nil
 }
 
-func verifyWinSSHVersion() error {
+func verifyWinSSHVersion(ctx context.Context) error {
 	sshdPath, err := getWindowsServiceImagePath(sshdRegKey)
 	if err != nil {
-		return fmt.Errorf("Cannot determine sshd path: %v", err)
+		return fmt.Errorf("cannot determine sshd path: %v", err)
 	}
 
-	sshdVersion, err := getWindowsExeVersion(sshdPath)
+	sshdVersion, err := getWindowsExeVersion(ctx, sshdPath)
 	if err != nil {
-		return fmt.Errorf("Cannot determine OpenSSH Version: %v", err)
+		return fmt.Errorf("cannot determine OpenSSH Version: %v", err)
 	}
 
 	return versionOk(sshdVersion, minSSHVersion)
@@ -334,12 +334,12 @@ func (a *winAccountsMgr) set(ctx context.Context) error {
 
 	if sshEnable {
 		if sshEnable != oldSSHEnable {
-			err := verifyWinSSHVersion()
+			err := verifyWinSSHVersion(ctx)
 			if err != nil {
 				logger.Warningf(err.Error())
 			}
 
-			if !checkWindowsServiceRunning("sshd") {
+			if !checkWindowsServiceRunning(ctx, "sshd") {
 				logger.Warningf("The 'enable-windows-ssh' metadata key is set to 'true' " +
 					"but sshd does not appear to be running.")
 			}
@@ -357,7 +357,7 @@ func (a *winAccountsMgr) set(ctx context.Context) error {
 		mdKeyMap := getUserKeys(mdkeys)
 
 		for user := range mdKeyMap {
-			if err := createSSHUser(user); err != nil {
+			if err := createSSHUser(ctx, user); err != nil {
 				logger.Errorf("Error creating user: %s", err)
 			}
 		}
@@ -372,7 +372,7 @@ func (a *winAccountsMgr) set(ctx context.Context) error {
 	toAdd := compareAccounts(newKeys, regKeys)
 
 	for _, key := range toAdd {
-		creds, err := createOrResetPwd(key)
+		creds, err := createOrResetPwd(ctx, key)
 		if err == nil {
 			printCreds(creds)
 			continue

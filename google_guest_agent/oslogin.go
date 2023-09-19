@@ -17,7 +17,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"runtime"
@@ -100,7 +99,12 @@ func (o *osloginMgr) set(ctx context.Context) error {
 		logger.Infof("Disabling OS Login")
 	}
 
-	if err := writeSSHConfig(enable, twofactor, skey); err != nil {
+	// [Unstable] configuration section has no long term stability or support guarantees/promises.
+	// Configurations defined in the Unstable section will be by default disabled and is intended to
+	// isolate under development features.
+	pamlessAuthStack := config.Section("Unstable").Key("pamless_auth_stack").MustBool(false)
+
+	if err := writeSSHConfig(enable, twofactor, pamlessAuthStack, skey); err != nil {
 		logger.Errorf("Error updating SSH config: %v.", err)
 	}
 
@@ -108,7 +112,7 @@ func (o *osloginMgr) set(ctx context.Context) error {
 		logger.Errorf("Error updating NSS config: %v.", err)
 	}
 
-	if err := writePAMConfig(enable, twofactor); err != nil {
+	if err := writePAMConfig(enable, twofactor, pamlessAuthStack); err != nil {
 		logger.Errorf("Error updating PAM config: %v.", err)
 	}
 
@@ -119,7 +123,7 @@ func (o *osloginMgr) set(ctx context.Context) error {
 	for _, svc := range []string{"nscd", "unscd", "systemd-logind", "cron", "crond"} {
 		// These services should be restarted if running
 		logger.Debugf("systemctl try-restart %s, if it exists", svc)
-		if err := systemctlTryRestart(svc); err != nil {
+		if err := systemctlTryRestart(ctx, svc); err != nil {
 			logger.Errorf("Error restarting service: %v.", err)
 		}
 	}
@@ -127,7 +131,7 @@ func (o *osloginMgr) set(ctx context.Context) error {
 	// SSH should be started if not running, reloaded otherwise.
 	for _, svc := range []string{"ssh", "sshd"} {
 		logger.Debugf("systemctl reload-or-restart %s, if it exists", svc)
-		if err := systemctlReloadOrRestart(svc); err != nil {
+		if err := systemctlReloadOrRestart(ctx, svc); err != nil {
 			logger.Errorf("Error reloading service: %v.", err)
 		}
 	}
@@ -137,7 +141,7 @@ func (o *osloginMgr) set(ctx context.Context) error {
 
 	if enable {
 		logger.Debugf("Create OS Login dirs, if needed")
-		if err := createOSLoginDirs(); err != nil {
+		if err := createOSLoginDirs(ctx); err != nil {
 			logger.Errorf("Error creating OS Login directory: %v.", err)
 		}
 
@@ -147,7 +151,7 @@ func (o *osloginMgr) set(ctx context.Context) error {
 		}
 
 		logger.Debugf("starting OS Login nss cache fill")
-		if err := run.Quiet("google_oslogin_nss_cache"); err != nil {
+		if err := run.Quiet(ctx, "google_oslogin_nss_cache"); err != nil {
 			logger.Errorf("Error updating NSS cache: %v.", err)
 		}
 
@@ -188,7 +192,7 @@ func writeConfigFile(path, contents string) error {
 	return nil
 }
 
-func updateSSHConfig(sshConfig string, enable, twofactor, skey bool) string {
+func updateSSHConfig(sshConfig string, enable, twofactor, pamlessAuthStack, skey bool) string {
 	// TODO: this feels like a case for a text/template
 	challengeResponseEnable := "ChallengeResponseAuthentication yes"
 	authorizedKeysCommand := "AuthorizedKeysCommand /usr/bin/google_authorized_keys"
@@ -202,6 +206,8 @@ func updateSSHConfig(sshConfig string, enable, twofactor, skey bool) string {
 		}
 	}
 	authorizedKeysUser := "AuthorizedKeysCommandUser root"
+	authorizedPrincipalsCommand := "AuthorizedPrincipalsCommand %u %k"
+	authorizedPrincipalsUser := "AuthorizedPrincipalsCommandUser root"
 
 	// TODO: only enable this key configuration if certs mechanism is enabled
 	trustedUserCAKeys := "TrustedUserCAKeys " + sshtrustedca.DefaultPipePath
@@ -218,6 +224,10 @@ func updateSSHConfig(sshConfig string, enable, twofactor, skey bool) string {
 
 	if enable {
 		osLoginBlock := []string{googleBlockStart, authorizedKeysCommand, authorizedKeysUser, trustedUserCAKeys}
+		if pamlessAuthStack {
+			osLoginBlock = append(osLoginBlock, authorizedPrincipalsCommand, authorizedPrincipalsUser)
+		}
+
 		if twofactor {
 			osLoginBlock = append(osLoginBlock, twoFactorAuthMethods, challengeResponseEnable)
 		}
@@ -231,12 +241,12 @@ func updateSSHConfig(sshConfig string, enable, twofactor, skey bool) string {
 	return strings.Join(filtered, "\n")
 }
 
-func writeSSHConfig(enable, twofactor, skey bool) error {
-	sshConfig, err := ioutil.ReadFile("/etc/ssh/sshd_config")
+func writeSSHConfig(enable, twofactor, pamlessAuthStack, skey bool) error {
+	sshConfig, err := os.ReadFile("/etc/ssh/sshd_config")
 	if err != nil {
 		return err
 	}
-	proposed := updateSSHConfig(string(sshConfig), enable, twofactor, skey)
+	proposed := updateSSHConfig(string(sshConfig), enable, twofactor, pamlessAuthStack, skey)
 	if proposed == string(sshConfig) {
 		return nil
 	}
@@ -266,7 +276,7 @@ func updateNSSwitchConfig(nsswitch string, enable bool) string {
 }
 
 func writeNSSwitchConfig(enable bool) error {
-	nsswitch, err := ioutil.ReadFile("/etc/nsswitch.conf")
+	nsswitch, err := os.ReadFile("/etc/nsswitch.conf")
 	if err != nil {
 		return err
 	}
@@ -275,6 +285,31 @@ func writeNSSwitchConfig(enable bool) error {
 		return nil
 	}
 	return writeConfigFile("/etc/nsswitch.conf", proposed)
+}
+
+func updatePAMsshdPamless(pamsshd string, enable, twofactor bool) string {
+	authOSLogin := "auth       [success=done perm_denied=die default=ignore] pam_oslogin_login.so"
+	authGroup := "auth       [default=ignore] pam_group.so"
+	sessionHomeDir := "session    [success=ok default=ignore] pam_mkhomedir.so"
+
+	if runtime.GOOS == "freebsd" {
+		authOSLogin = "auth       optional pam_oslogin_login.so"
+		authGroup = "auth       optional pam_group.so"
+		sessionHomeDir = "session    optional pam_mkhomedir.so"
+	}
+
+	filtered := filterGoogleLines(string(pamsshd))
+	if enable {
+		topOfFile := []string{googleBlockStart}
+		if twofactor {
+			topOfFile = append(topOfFile, authOSLogin)
+		}
+		topOfFile = append(topOfFile, authGroup, googleBlockEnd)
+		bottomOfFile := []string{googleBlockStart, sessionHomeDir, googleBlockEnd}
+		filtered = append(topOfFile, filtered...)
+		filtered = append(filtered, bottomOfFile...)
+	}
+	return strings.Join(filtered, "\n")
 }
 
 // Adds entries to the PAM config for sshd and su which reflect the current
@@ -308,12 +343,19 @@ func updatePAMsshd(pamsshd string, enable, twofactor bool) string {
 	return strings.Join(filtered, "\n")
 }
 
-func writePAMConfig(enable, twofactor bool) error {
-	pamsshd, err := ioutil.ReadFile("/etc/pam.d/sshd")
+func writePAMConfig(enable, twofactor, pamlessAuthStack bool) error {
+	pamsshd, err := os.ReadFile("/etc/pam.d/sshd")
 	if err != nil {
 		return err
 	}
-	proposed := updatePAMsshd(string(pamsshd), enable, twofactor)
+
+	var proposed string
+	if pamlessAuthStack {
+		proposed = updatePAMsshdPamless(string(pamsshd), enable, twofactor)
+	} else {
+		proposed = updatePAMsshd(string(pamsshd), enable, twofactor)
+	}
+
 	if proposed != string(pamsshd) {
 		if err := writeConfigFile("/etc/pam.d/sshd", proposed); err != nil {
 			return err
@@ -335,7 +377,7 @@ func updateGroupConf(groupconf string, enable bool) string {
 }
 
 func writeGroupConf(enable bool) error {
-	groupconf, err := ioutil.ReadFile("/etc/security/group.conf")
+	groupconf, err := os.ReadFile("/etc/security/group.conf")
 	if err != nil {
 		return err
 	}
@@ -349,7 +391,7 @@ func writeGroupConf(enable bool) error {
 }
 
 // Creates necessary OS Login directories if they don't exist.
-func createOSLoginDirs() error {
+func createOSLoginDirs(ctx context.Context) error {
 	restorecon, restoreconerr := exec.LookPath("restorecon")
 
 	for _, dir := range []string{"/var/google-sudoers.d", "/var/google-users.d"} {
@@ -358,7 +400,7 @@ func createOSLoginDirs() error {
 			return err
 		}
 		if restoreconerr == nil {
-			run.Quiet(restorecon, dir)
+			run.Quiet(ctx, restorecon, dir)
 		}
 	}
 	return nil
@@ -382,32 +424,32 @@ func createOSLoginSudoersFile() error {
 
 // systemctlTryRestart tries to restart a systemd service if it is already
 // running. Stopped services will be ignored.
-func systemctlTryRestart(servicename string) error {
-	if !systemctlUnitExists(servicename) {
+func systemctlTryRestart(ctx context.Context, servicename string) error {
+	if !systemctlUnitExists(ctx, servicename) {
 		return nil
 	}
-	return run.Quiet("systemctl", "try-restart", servicename+".service")
+	return run.Quiet(ctx, "systemctl", "try-restart", servicename+".service")
 }
 
 // systemctlReloadOrRestart tries to reload a running systemd service if
 // supported, restart otherwise. Stopped services will be started.
-func systemctlReloadOrRestart(servicename string) error {
-	if !systemctlUnitExists(servicename) {
+func systemctlReloadOrRestart(ctx context.Context, servicename string) error {
+	if !systemctlUnitExists(ctx, servicename) {
 		return nil
 	}
-	return run.Quiet("systemctl", "reload-or-restart", servicename+".service")
+	return run.Quiet(ctx, "systemctl", "reload-or-restart", servicename+".service")
 }
 
 // systemctlStart tries to start a stopped systemd service. Started services
 // will be ignored.
-func systemctlStart(servicename string) error {
-	if !systemctlUnitExists(servicename) {
+func systemctlStart(ctx context.Context, servicename string) error {
+	if !systemctlUnitExists(ctx, servicename) {
 		return nil
 	}
-	return run.Quiet("systemctl", "start", servicename+".service")
+	return run.Quiet(ctx, "systemctl", "start", servicename+".service")
 }
 
-func systemctlUnitExists(servicename string) bool {
-	res := run.WithOutput("systemctl", "list-units", "--all", servicename+".service")
+func systemctlUnitExists(ctx context.Context, servicename string) bool {
+	res := run.WithOutput(ctx, "systemctl", "list-units", "--all", servicename+".service")
 	return !strings.Contains(res.StdOut, "0 loaded units listed")
 }
