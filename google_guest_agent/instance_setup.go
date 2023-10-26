@@ -1,16 +1,16 @@
-//  Copyright 2019 Google Inc. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Copyright 2019 Google LLC
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     https://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package main
 
@@ -25,7 +25,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/agentcrypto"
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/cfg"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/run"
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/scheduler"
 	"github.com/GoogleCloudPlatform/guest-logging-go/logger"
 	"github.com/go-ini/ini"
 )
@@ -88,6 +91,7 @@ func agentInit(ctx context.Context) {
 	//  - Run `google_optimize_local_ssd` script.
 	//  - Run `google_set_multiqueue` script.
 	// TODO incorporate these scripts into the agent. liamh@12-11-19
+	config := cfg.Get()
 
 	if runtime.GOOS == "windows" {
 		// Indefinitely retry to set up required MDS route.
@@ -103,19 +107,30 @@ func agentInit(ctx context.Context) {
 		defer run.Quiet(ctx, "systemd-notify", "--ready")
 		defer logger.Debugf("notify systemd")
 
-		if config.Section("Snapshots").Key("enabled").MustBool(false) {
+		if config.Snapshots.Enabled {
 			logger.Infof("Snapshot listener enabled")
-			snapshotServiceIP := config.Section("Snapshots").Key("snapshot_service_ip").MustString("169.254.169.254")
-			snapshotServicePort := config.Section("Snapshots").Key("snapshot_service_port").MustInt(8081)
-			startSnapshotListener(ctx, snapshotServiceIP, snapshotServicePort)
+			snapshotServiceIP := config.Snapshots.SnapshotServiceIP
+			snapshotServicePort := config.Snapshots.SnapshotServicePort
+			timeoutInSeconds := config.Snapshots.TimeoutInSeconds
+			startSnapshotListener(ctx, snapshotServiceIP, snapshotServicePort, timeoutInSeconds)
+		}
+
+		scripts := []struct {
+			enabled bool
+			script  string
+		}{
+			{config.InstanceSetup.OptimizeLocalSSD, "optimize_local_ssd"},
+			{config.InstanceSetup.SetMultiqueue, "set_multiqueue"},
 		}
 
 		// These scripts are run regardless of metadata/network access and config options.
-		for _, script := range []string{"optimize_local_ssd", "set_multiqueue"} {
-			if config.Section("InstanceSetup").Key(script).MustBool(true) {
-				if err := run.Quiet(ctx, "google_"+script); err != nil {
-					logger.Warningf("Failed to run %q script: %v", "google_"+script, err)
-				}
+		for _, curr := range scripts {
+			if !curr.enabled {
+				continue
+			}
+
+			if err := run.Quiet(ctx, "google_"+curr.script); err != nil {
+				logger.Warningf("Failed to run %q script: %v", "google_"+curr.script, err)
 			}
 		}
 
@@ -130,18 +145,19 @@ func agentInit(ctx context.Context) {
 		}
 
 		// Allow users to opt out of below instance setup actions.
-		if !config.Section("InstanceSetup").Key("network_enabled").MustBool(true) {
+		if !config.InstanceSetup.NetworkEnabled {
 			logger.Infof("InstanceSetup.network_enabled is false, skipping setup actions that require metadata")
 			return
 		}
 
-		// The below actions require metadata to be set, so if it
-		// hasn't yet been set, wait on it here. In instances without
-		// network access, this will become an indefinite wait.
-		// TODO: split agentInit into needs-network and no-network functions.
-		for newMetadata == nil {
-			logger.Debugf("populate first time metadata...")
-			newMetadata, _ = mdsClient.Get(ctx)
+		if newMetadata == nil {
+			var err error
+			logger.Debugf("populate metadata for the first time...")
+			newMetadata, err = mdsClient.Get(ctx)
+			if err != nil {
+				logger.Errorf("Failed to reach MDS(all retries exhausted): %+v", err)
+				os.Exit(1)
+			}
 		}
 
 		// Disable overcommit accounting; e2 instances only.
@@ -155,14 +171,14 @@ func agentInit(ctx context.Context) {
 		// Check if instance ID has changed, and if so, consider this
 		// the first boot of the instance.
 		// TODO Also do this for windows. liamh@13-11-2019
-		instanceIDFile := config.Section("Instance").Key("instance_id_dir").MustString("/etc") + "/google_instance_id"
+		instanceIDFile := config.Instance.InstanceIDDir
 		instanceID, err := os.ReadFile(instanceIDFile)
 		if err != nil && !os.IsNotExist(err) {
 			logger.Warningf("Not running first-boot actions, error reading instance ID: %v", err)
 		} else {
 			if string(instanceID) == "" {
 				// If the file didn't exist or was empty, try legacy key from instance configs.
-				instanceID = []byte(config.Section("Instance").Key("instance_id").String())
+				instanceID = []byte(config.Instance.InstanceID)
 
 				// Write instance ID to file for next time before moving on.
 				towrite := fmt.Sprintf("%s\n", newMetadata.Instance.ID.String())
@@ -172,12 +188,12 @@ func agentInit(ctx context.Context) {
 			}
 			if newMetadata.Instance.ID.String() != strings.TrimSpace(string(instanceID)) {
 				logger.Infof("Instance ID changed, running first-boot actions")
-				if config.Section("InstanceSetup").Key("set_host_keys").MustBool(true) {
+				if config.InstanceSetup.SetHostKeys {
 					if err := generateSSHKeys(ctx); err != nil {
 						logger.Warningf("Failed to generate SSH keys: %v", err)
 					}
 				}
-				if config.Section("InstanceSetup").Key("set_boto_config").MustBool(true) {
+				if config.InstanceSetup.SetBotoConfig {
 					if err := generateBotoConfig(); err != nil {
 						logger.Warningf("Failed to create boto.cfg: %v", err)
 					}
@@ -191,10 +207,19 @@ func agentInit(ctx context.Context) {
 			}
 		}
 	}
+	// Schedules jobs that need to be started before notifying systemd Agent process has started.
+	// We want to generate MDS credentials as early as possible so that any process in the Guest can
+	// use them. Processes may depend on the Guest Agent at startup to ensure that the credentials are
+	// available for use. By generating the credentials before notifying the systemd, we ensure that
+	// they are generated for any process that depends on the Guest Agent.
+	if config.Unstable.MDSMTLS {
+		scheduler.ScheduleJobs(ctx, []scheduler.Job{agentcrypto.New()}, true)
+	}
 }
 
 func generateSSHKeys(ctx context.Context) error {
-	hostKeyDir := config.Section("InstanceSetup").Key("host_key_dir").MustString("/etc/ssh")
+	config := cfg.Get()
+	hostKeyDir := config.InstanceSetup.HostKeyDir
 	dir, err := os.Open(hostKeyDir)
 	if err != nil {
 		return err
@@ -221,7 +246,7 @@ func generateSSHKeys(ctx context.Context) error {
 	}
 
 	// List keys we should generate, according to the config.
-	configKeys := config.Section("InstanceSetup").Key("host_key_types").MustString("ecdsa,ed25519,rsa")
+	configKeys := config.InstanceSetup.HostKeyTypes
 	for _, keytype := range strings.Split(configKeys, ",") {
 		keytypes[keytype] = true
 	}

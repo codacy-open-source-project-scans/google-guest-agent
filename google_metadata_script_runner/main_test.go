@@ -1,27 +1,28 @@
-//  Copyright 2017 Google Inc. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Copyright 2017 Google LLC
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     https://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package main
 
 import (
+	"context"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"reflect"
 	"testing"
+
+	"github.com/GoogleCloudPlatform/guest-agent/metadata"
 )
 
 func TestMain(m *testing.M) {
@@ -158,17 +159,33 @@ func TestParseGCS(t *testing.T) {
 	}
 }
 
+type mdsClient struct{}
+
+func (mds *mdsClient) Get(ctx context.Context) (*metadata.Descriptor, error) {
+	return nil, fmt.Errorf("Get() not yet implemented")
+}
+
+func (mds *mdsClient) GetKey(ctx context.Context, key string, headers map[string]string) (string, error) {
+	return "", fmt.Errorf("GetKey() not yet implemented")
+}
+
+func (mds *mdsClient) GetKeyRecursive(ctx context.Context, key string) (string, error) {
+	return `{"key1":"value1","key2":"value2"}`, nil
+}
+
+func (mds *mdsClient) Watch(ctx context.Context) (*metadata.Descriptor, error) {
+	return nil, fmt.Errorf("Watch() not yet implemented")
+}
+
+func (mds *mdsClient) WriteGuestAttributes(ctx context.Context, key string, value string) error {
+	return fmt.Errorf("WriteGuestattributes() not yet implemented")
+}
+
 func TestGetMetadata(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, `{"key1":"value1","key2":"value2"}`)
-	}))
-	defer ts.Close()
-
-	metadataURL = ts.URL
-	metadataHang = ""
-
+	ctx := context.Background()
+	client = &mdsClient{}
 	want := map[string]string{"key1": "value1", "key2": "value2"}
-	got, err := getMetadataAttributes("")
+	got, err := getMetadataAttributes(ctx, "")
 	if err != nil {
 		t.Fatalf("error running getMetadataAttributes: %v", err)
 	}

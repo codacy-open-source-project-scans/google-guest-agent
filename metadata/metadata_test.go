@@ -1,16 +1,16 @@
-//  Copyright 2018 Google Inc. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Copyright 2018 Google LLC
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     https://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package metadata
 
@@ -136,6 +136,36 @@ func TestGetKey(t *testing.T) {
 	}
 	if wantValue != gotValue {
 		t.Errorf("did not get expected return value, got :%q, want: %q", gotValue, wantValue)
+	}
+	if gotReqURI != wantURI {
+		t.Errorf("did not get expected request uri, got :%q, want: %q", gotReqURI, wantURI)
+	}
+}
+
+func TestGetKeyRecursive(t *testing.T) {
+	var gotReqURI string
+	wantValue := `{"ssh-keys":"name:ssh-rsa [KEY] instance1\nothername:ssh-rsa [KEY] instance2","block-project-ssh-keys":"false","other-metadata":"foo"}`
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotReqURI = r.RequestURI
+		fmt.Fprint(w, wantValue)
+	})
+
+	testsrv := httptest.NewServer(handler)
+	defer testsrv.Close()
+
+	client := New()
+	client.metadataURL = testsrv.URL
+
+	key := "key"
+	wantURI := fmt.Sprintf("/%s?alt=json&recursive=true", key)
+	gotValue, err := client.GetKeyRecursive(context.Background(), key)
+	if err != nil {
+		t.Errorf("client.GetKeyRecursive(ctx, %s) failed unexpectedly with error: %v", key, err)
+	}
+
+	if wantValue != gotValue {
+		t.Errorf("client.GetKeyRecursive(ctx, %s) = %q, want: %q", key, gotValue, wantValue)
 	}
 	if gotReqURI != wantURI {
 		t.Errorf("did not get expected request uri, got :%q, want: %q", gotReqURI, wantURI)

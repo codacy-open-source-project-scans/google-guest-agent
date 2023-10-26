@@ -1,16 +1,16 @@
-//  Copyright 2018 Google Inc. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Copyright 2018 Google LLC
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     https://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package main
 
@@ -18,9 +18,10 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
-	"strconv"
+	"runtime"
 	"sync/atomic"
 
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/cfg"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/run"
 	"github.com/GoogleCloudPlatform/guest-agent/utils"
 	"github.com/GoogleCloudPlatform/guest-logging-go/logger"
@@ -42,20 +43,28 @@ type diagnosticsEntry struct {
 	Trace     bool
 }
 
-type diagnosticsMgr struct{}
-
-func (d *diagnosticsMgr) diff() bool {
-	return !reflect.DeepEqual(newMetadata.Instance.Attributes.Diagnostics, oldMetadata.Instance.Attributes.Diagnostics)
+type diagnosticsMgr struct {
+	// fakeWindows forces Disabled to run as if it was running in a windows system.
+	// mostly target for unit tests.
+	fakeWindows bool
 }
 
-func (d *diagnosticsMgr) timeout() bool {
-	return false
+func (d *diagnosticsMgr) Diff(ctx context.Context) (bool, error) {
+	return !reflect.DeepEqual(newMetadata.Instance.Attributes.Diagnostics, oldMetadata.Instance.Attributes.Diagnostics), nil
 }
 
-func (d *diagnosticsMgr) disabled(os string) (disabled bool) {
-	if os != "windows" {
-		return true
+func (d *diagnosticsMgr) Timeout(ctx context.Context) (bool, error) {
+	return false, nil
+}
+
+func (d *diagnosticsMgr) Disabled(ctx context.Context) (bool, error) {
+	var disabled bool
+	config := cfg.Get()
+
+	if !d.fakeWindows && runtime.GOOS != "windows" {
+		return true, nil
 	}
+
 	defer func() {
 		if disabled != diagnosticsDisabled {
 			diagnosticsDisabled = disabled
@@ -64,24 +73,20 @@ func (d *diagnosticsMgr) disabled(os string) (disabled bool) {
 	}()
 
 	// Diagnostics are opt-in and enabled by default.
-	var err error
-	var enabled bool
-	enabled, err = strconv.ParseBool(config.Section("diagnostics").Key("enable").String())
-	if err == nil {
-		return !enabled
+	if config.Diagnostics != nil {
+		return !config.Diagnostics.Enable, nil
 	}
+
 	if newMetadata.Instance.Attributes.EnableDiagnostics != nil {
-		enabled = *newMetadata.Instance.Attributes.EnableDiagnostics
-		return !enabled
+		return !*newMetadata.Instance.Attributes.EnableDiagnostics, nil
 	}
 	if newMetadata.Project.Attributes.EnableDiagnostics != nil {
-		enabled = *newMetadata.Project.Attributes.EnableDiagnostics
-		return !enabled
+		return !*newMetadata.Project.Attributes.EnableDiagnostics, nil
 	}
-	return diagnosticsDisabled
+	return diagnosticsDisabled, nil
 }
 
-func (d *diagnosticsMgr) set(ctx context.Context) error {
+func (d *diagnosticsMgr) Set(ctx context.Context) error {
 	logger.Infof("Diagnostics: logs export requested.")
 	diagnosticsEntries, err := readRegMultiString(regKeyBase, diagnosticsRegKey)
 	if err != nil && err != errRegNotExist {

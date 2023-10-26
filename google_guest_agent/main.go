@@ -1,16 +1,16 @@
-//  Copyright 2017 Google Inc. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Copyright 2017 Google LLC
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     https://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // GCEGuestAgent is the Google Compute Engine guest agent executable.
 package main
@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/cfg"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/events"
 	mdsEvent "github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/events/metadata"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/osinfo"
@@ -33,7 +34,6 @@ import (
 	"github.com/GoogleCloudPlatform/guest-agent/metadata"
 	"github.com/GoogleCloudPlatform/guest-agent/utils"
 	"github.com/GoogleCloudPlatform/guest-logging-go/logger"
-	"github.com/go-ini/ini"
 )
 
 // Certificates wrapps a list of certificate authorities.
@@ -50,22 +50,19 @@ var (
 	programName              = "GCEGuestAgent"
 	version                  string
 	oldMetadata, newMetadata *metadata.Descriptor
-	config                   *ini.File
 	osInfo                   osinfo.OSInfo
 	mdsClient                *metadata.Client
 )
 
 const (
-	winConfigPath = `C:\Program Files\Google\Compute Engine\instance_configs.cfg`
-	configPath    = `/etc/default/instance_configs.cfg`
-	regKeyBase    = `SOFTWARE\Google\ComputeEngine`
+	regKeyBase = `SOFTWARE\Google\ComputeEngine`
 )
 
 type manager interface {
-	diff() bool
-	disabled(string) bool
-	set(ctx context.Context) error
-	timeout() bool
+	Diff(ctx context.Context) (bool, error)
+	Disabled(ctx context.Context) (bool, error)
+	Set(ctx context.Context) error
+	Timeout(ctx context.Context) (bool, error)
 }
 
 func logStatus(name string, disabled bool) {
@@ -79,15 +76,6 @@ func logStatus(name string, disabled bool) {
 	logger.Infof("GCE %s manager status: %s", name, status)
 }
 
-func parseConfig(file string) (*ini.File, error) {
-	// Priority: file.cfg, file.cfg.distro, file.cfg.template
-	cfg, err := ini.LoadSources(ini.LoadOptions{Loose: true, Insensitive: true}, file, file+".distro", file+".template")
-	if err != nil {
-		return nil, err
-	}
-	return cfg, nil
-}
-
 func closeFile(c io.Closer) {
 	err := c.Close()
 	if err != nil {
@@ -95,30 +83,64 @@ func closeFile(c io.Closer) {
 	}
 }
 
+func availableManagers() []manager {
+	managers := []manager{
+		&addressMgr{},
+	}
+
+	if runtime.GOOS == "windows" {
+		return append(managers,
+			newWsfcManager(),
+			&winAccountsMgr{},
+			&diagnosticsMgr{},
+		)
+	}
+
+	return append(managers,
+		&clockskewMgr{},
+		&osloginMgr{},
+		&accountsMgr{},
+	)
+}
+
 func runUpdate(ctx context.Context) {
 	var wg sync.WaitGroup
-	mgrs := []manager{&addressMgr{}}
-	switch runtime.GOOS {
-	case "windows":
-		mgrs = append(mgrs, []manager{newWsfcManager(), &winAccountsMgr{}, &diagnosticsMgr{}}...)
-	default:
-		mgrs = append(mgrs, []manager{&clockskewMgr{}, &osloginMgr{}, &accountsMgr{}}...)
-	}
-	for _, mgr := range mgrs {
+	for _, mgr := range availableManagers() {
 		wg.Add(1)
 		go func(mgr manager) {
 			defer wg.Done()
-			if mgr.disabled(runtime.GOOS) {
+
+			disabled, err := mgr.Disabled(ctx)
+			if err != nil {
+				logger.Errorf("Failed to run manager's Disabled() call: %+v", err)
+				return
+			}
+
+			if disabled {
 				logger.Debugf("manager %#v disabled, skipping", mgr)
 				return
 			}
-			if !mgr.timeout() && !mgr.diff() {
-				logger.Debugf("manager %#v reports no diff", mgr)
+
+			timeout, err := mgr.Timeout(ctx)
+			if err != nil {
+				logger.Errorf("[%#v] Failed to run manager Timeout() call: %+v", mgr, err)
 				return
 			}
+
+			diff, err := mgr.Diff(ctx)
+			if err != nil {
+				logger.Errorf("[%#v] Failed to run manager Diff() call: %+v", mgr, err)
+				return
+			}
+
+			if !timeout && !diff {
+				logger.Debugf("[%#v] Manager reports no diff", mgr)
+				return
+			}
+
 			logger.Debugf("running %#v manager", mgr)
-			if err := mgr.set(ctx); err != nil {
-				logger.Errorf("error running %#v manager: %s", mgr, err)
+			if err := mgr.Set(ctx); err != nil {
+				logger.Errorf("[%#v] Failed to run manager Set() call: %s", mgr, err)
 			}
 		}(mgr)
 	}
@@ -149,25 +171,14 @@ func runAgent(ctx context.Context) {
 	logger.Infof("GCE Agent Started (version %s)", version)
 
 	osInfo = osinfo.Get()
-
-	cfgfile := configPath
-	if runtime.GOOS == "windows" {
-		cfgfile = winConfigPath
-	}
-
-	var err error
-	config, err = parseConfig(cfgfile)
-	if err != nil && !os.IsNotExist(err) {
-		logger.Errorf("Error parsing config %s: %s", cfgfile, err)
-	}
-
 	mdsClient = metadata.New()
 
 	agentInit(ctx)
 
 	// Previous request to metadata *may* not have worked becasue routes don't get added until agentInit.
+	var err error
 	if newMetadata == nil {
-		/// Error here doesn't matter, if we cant get metadata, we cant record telemetry.
+		// Error here doesn't matter, if we cant get metadata, we cant record telemetry.
 		newMetadata, err = mdsClient.Get(ctx)
 		if err != nil {
 			logger.Debugf("Error getting metdata: %v", err)
@@ -187,15 +198,14 @@ func runAgent(ctx context.Context) {
 	knownJobs := []scheduler.Job{telemetry.New(mdsClient, programName, version)}
 	scheduler.ScheduleJobs(ctx, knownJobs, false)
 
-	eventsConfig := &events.Config{
-		Watchers: []string{
-			mdsEvent.WatcherID,
-		},
+	eventManager := events.Get()
+	if err := eventManager.AddDefaultWatchers(ctx); err != nil {
+		logger.Errorf("Error initializing event manager: %v", err)
+		return
 	}
 
-	eventManager, err := events.New(eventsConfig)
-	if err != nil {
-		logger.Errorf("Error initializing event manager: %v", err)
+	if err := enableDisableOSLoginCertAuth(ctx); err != nil {
+		logger.Errorf("Failed to enable sshtrustedca watcher: %+v", err)
 		return
 	}
 
@@ -216,13 +226,21 @@ func runAgent(ctx context.Context) {
 		}
 
 		newMetadata = evData.Data.(*metadata.Descriptor)
+
+		if err := enableDisableOSLoginCertAuth(ctx); err != nil {
+			logger.Errorf("Failed to enable/disable sshtrustedca watcher: %+v", err)
+		}
+
 		runUpdate(ctx)
 		oldMetadata = newMetadata
 
 		return true
 	})
 
-	eventManager.Run(ctx)
+	if err := eventManager.Run(ctx); err != nil {
+		logger.Fatalf("Failed to run event manager: %+v", err)
+	}
+
 	logger.Infof("GCE Agent Stopped")
 }
 
@@ -252,6 +270,11 @@ func closer(c io.Closer) {
 
 func main() {
 	ctx := context.Background()
+
+	if err := cfg.Load(nil); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load configuration: %+v", err)
+		os.Exit(1)
+	}
 
 	var action string
 	if len(os.Args) < 2 {

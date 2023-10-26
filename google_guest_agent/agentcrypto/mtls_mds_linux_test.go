@@ -1,16 +1,16 @@
-//  Copyright 2023 Google Inc. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Copyright 2023 Google LLC
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     https://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package agentcrypto
 
@@ -132,17 +132,24 @@ func TestShouldEnableError(t *testing.T) {
 }
 
 func TestCertificateDirFromUpdater(t *testing.T) {
+	updater1Dir := t.TempDir()
+	updater2Dir := t.TempDir()
+	certUpdaters = map[string][]string{
+		"updater1": {updater1Dir},
+		"updater2": {"/does/not/exist", updater2Dir},
+	}
+
 	tests := []struct {
 		updater string
 		want    string
 	}{
 		{
-			updater: "update-ca-certificates",
-			want:    "/usr/local/share/ca-certificates/",
+			updater: "updater1",
+			want:    updater1Dir,
 		},
 		{
-			updater: "update-ca-trust",
-			want:    "/etc/pki/ca-trust/source/anchors/",
+			updater: "updater2",
+			want:    updater2Dir,
 		},
 	}
 
@@ -160,8 +167,18 @@ func TestCertificateDirFromUpdater(t *testing.T) {
 }
 
 func TestCertificateDirFromUpdaterError(t *testing.T) {
+	// Fail for unknown updater.
 	_, err := certificateDirFromUpdater("unknown")
 	if err == nil {
 		t.Errorf("certificateDirFromUpdater(unknown) succeeded for unknown updater, want error")
+	}
+
+	// Fail for missing known cert dir.
+	certUpdaters = map[string][]string{
+		"updater1": {"/no/dir/exist"},
+	}
+	_, err = certificateDirFromUpdater("updater1")
+	if err == nil {
+		t.Errorf("certificateDirFromUpdater(unknown) succeeded for missing cert dir, want error")
 	}
 }

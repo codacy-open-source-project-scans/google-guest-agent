@@ -1,20 +1,21 @@
-//  Copyright 2022 Google Inc. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Copyright 2022 Google LLC
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     https://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package utils
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -37,19 +38,23 @@ func TestContainsString(t *testing.T) {
 }
 
 func TestGetUserKey(t *testing.T) {
+	pubKey := MakeRandRSAPubKey(t)
+
 	table := []struct {
 		key    string
 		user   string
 		keyVal string
 		haserr bool
 	}{
-		{`usera:ssh-rsa AAAA1234 google-ssh {"userName":"usera@example.com","expireOn":"2095-04-23T12:34:56+0000"}`,
-			"usera", `ssh-rsa AAAA1234 google-ssh {"userName":"usera@example.com","expireOn":"2095-04-23T12:34:56+0000"}`, false},
+		{fmt.Sprintf(`usera:ssh-rsa %s google-ssh {"userName":"usera@example.com","expireOn":"2095-04-23T12:34:56+0000"}`, pubKey),
+			"usera", fmt.Sprintf(`ssh-rsa %s google-ssh {"userName":"usera@example.com","expireOn":"2095-04-23T12:34:56+0000"}`, pubKey), false},
+		{fmt.Sprintf(`usera:restrict,pty ssh-rsa %s google-ssh {"userName":"usera@example.com","expireOn":"2095-04-23T12:34:56+0000"}`, pubKey),
+			"usera", fmt.Sprintf(`restrict,pty ssh-rsa %s google-ssh {"userName":"usera@example.com","expireOn":"2095-04-23T12:34:56+0000"}`, pubKey), false},
 		{"    ", "", "", true},
-		{"ssh-rsa AAAA1234", "", "", true},
-		{":ssh-rsa AAAA1234", "", "", true},
+		{fmt.Sprintf("ssh-rsa %s", pubKey), "", "", true},
+		{fmt.Sprintf(":ssh-rsa %s", pubKey), "", "", true},
 		{"userb:", "", "", true},
-		{"userc:ssh-rsa AAAA1234 info text", "userc", "ssh-rsa AAAA1234 info text", false},
+		{fmt.Sprintf("userc:ssh-rsa %s info text", pubKey), "userc", fmt.Sprintf("ssh-rsa %s info text", pubKey), false},
 	}
 
 	for _, tt := range table {
@@ -62,19 +67,24 @@ func TestGetUserKey(t *testing.T) {
 }
 
 func TestValidateUserKey(t *testing.T) {
+	pubKey := MakeRandRSAPubKey(t)
+
 	table := []struct {
 		user   string
 		key    string
 		haserr bool
 	}{
-		{"usera", `ssh-rsa AAAA1234 google-ssh {"userName":"usera@example.com","expireOn":"2095-04-23T12:34:56+0000"}`, false},
-		{"user a", `ssh-rsa AAAA1234 google-ssh {"userName":"usera@example.com","expireOn":"2095-04-23T12:34:56+0000"}`, true},
-		{"usera", `ssh-rsa AAAA1234 google-ssh {"userName":"usera@example.com","expireOn":"2021-04-23T12:34:56+0000"}`, true},
-		{"usera", `ssh-rsa AAAA1234 google-ssh {"userName":"usera@example.com","expireOn":"Apri 4, 2056"}`, true},
-		{"usera", `ssh-rsa AAAA1234 google-ssh`, true},
-		{"usera", `ssh-rsa AAAA1234 test info`, false},
+		{"usera", fmt.Sprintf(`ssh-rsa %s google-ssh {"userName":"usera@example.com","expireOn":"2095-04-23T12:34:56+0000"}`, pubKey), false},
+		{"user a", fmt.Sprintf(`ssh-rsa %s google-ssh {"userName":"usera@example.com","expireOn":"2095-04-23T12:34:56+0000"}`, pubKey), true},
+		{"usera", fmt.Sprintf(`ssh-rsa %s google-ssh {"userName":"usera@example.com","expireOn":"2021-04-23T12:34:56+0000"}`, pubKey), true},
+		{"usera", fmt.Sprintf(`ssh-rsa %s google-ssh {"userName":"usera@example.com","expireOn":"Apri 4, 2056"}`, pubKey), true},
+		{"usera", fmt.Sprintf(`ssh-rsa %s google-ssh`, pubKey), true},
+		{"usera", fmt.Sprintf(`ssh-rsa %s test info`, pubKey), false},
+		{"", fmt.Sprintf("ssh-rsa %s", pubKey), true},
+		{"usera", fmt.Sprintf(`command="echo hi" ssh-rsa %s google-ssh {"userName":"usera@example.com","expireOn":"2095-04-23T12:34:56+0000"}`, pubKey), false},
+		{"usera", fmt.Sprintf(`command="echo hi" ssh-rsa %s google-ssh {"userName":"usera@example.com","expireOn":"2021-04-23T12:34:56+0000"}`, pubKey), true},
+		{"usera", fmt.Sprintf(`restrict,pty ssh-rsa %s google-ssh {"userName":"usera@example.com","expireOn":"2095-04-23T12:34:56+0000"}`, pubKey), false},
 		{"    ", "", true},
-		{"", "ssh-rsa AAAA1234", true},
 		{"userb", "", true},
 	}
 
@@ -88,25 +98,27 @@ func TestValidateUserKey(t *testing.T) {
 }
 
 func TestCheckExpiredKey(t *testing.T) {
+	pubKey := MakeRandRSAPubKey(t)
+
 	table := []struct {
 		key     string
 		expired bool
 	}{
-		{`usera:ssh-rsa AAAA1234 google-ssh {"userName":"usera@example.com","expireOn":"2095-04-23T12:34:56+0000"}`, false},
-		{`usera:ssh-rsa AAAA1234 google-ssh {"userName":"usera@example.com","expireOn":"2021-04-23T12:34:56+0000"}`, true},
-		{`usera:ssh-rsa AAAA1234 google-ssh {"userName":"usera@example.com","expireOn":"Apri 4, 2056"}`, true},
-		{`usera:ssh-rsa AAAA1234 google-ssh`, true},
+		{fmt.Sprintf(`usera:ssh-rsa %s google-ssh {"userName":"usera@example.com","expireOn":"2095-04-23T12:34:56+0000"}`, pubKey), false},
+		{fmt.Sprintf(`usera:ssh-rsa %s google-ssh {"userName":"usera@example.com","expireOn":"2021-04-23T12:34:56+0000"}`, pubKey), true},
+		{fmt.Sprintf(`usera:ssh-rsa %s google-ssh {"userName":"usera@example.com","expireOn":"Apri 4, 2056"}`, pubKey), true},
+		{fmt.Sprintf(`usera:ssh-rsa %s google-ssh`, pubKey), true},
 		{"    ", true},
-		{"ssh-rsa AAAA1234", false},
-		{":ssh-rsa AAAA1234", false},
-		{"usera:ssh-rsa AAAA1234", false},
+		{fmt.Sprintf("ssh-rsa %s", pubKey), false},
+		{fmt.Sprintf(":ssh-rsa %s", pubKey), false},
+		{fmt.Sprintf("usera:ssh-rsa %s", pubKey), false},
 	}
 
 	for _, tt := range table {
 		err := CheckExpiredKey(tt.key)
 		isExpired := err != nil
 		if isExpired != tt.expired {
-			t.Errorf("CheckExpiredKey(%s) incorrect return: expired: %t - want expired: %t", tt.key, isExpired, tt.expired)
+			t.Errorf("CheckExpiredKey(%s) incorrect return: expired: %t - want expired: %t, got err: %v", tt.key, isExpired, tt.expired, err)
 		}
 	}
 }
@@ -137,7 +149,7 @@ func TestSaferWriteFile(t *testing.T) {
 	f := filepath.Join(t.TempDir(), "file")
 	want := "test-data"
 
-	if err := SaferWriteFile([]byte(want), f); err != nil {
+	if err := SaferWriteFile([]byte(want), f, 0644); err != nil {
 		t.Errorf("SaferWriteFile(%s, %s) failed unexpectedly with err: %+v", "test-data", f, err)
 	}
 
@@ -147,6 +159,15 @@ func TestSaferWriteFile(t *testing.T) {
 	}
 	if string(got) != want {
 		t.Errorf("os.ReadFile(%s) = %s, want %s", f, string(got), want)
+	}
+
+	i, err := os.Stat(f)
+	if err != nil {
+		t.Errorf("os.Stat(%s) failed unexpectedly with err: %+v", f, err)
+	}
+
+	if i.Mode().Perm() != 0o644 {
+		t.Errorf("SaferWriteFile(%s) set incorrect permissions, os.Stat(%s) = %o, want %o", f, f, i.Mode().Perm(), 0o644)
 	}
 }
 
@@ -158,7 +179,7 @@ func TestCopyFile(t *testing.T) {
 	if err := os.WriteFile(src, []byte(want), 0777); err != nil {
 		t.Fatalf("failed to write test source file: %v", err)
 	}
-	if err := CopyFile(src, dst); err != nil {
+	if err := CopyFile(src, dst, 0644); err != nil {
 		t.Errorf("CopyFile(%s, %s) failed unexpectedly with error: %v", src, dst, err)
 	}
 
@@ -169,6 +190,15 @@ func TestCopyFile(t *testing.T) {
 	if string(got) != want {
 		t.Errorf("CopyFile(%s, %s) copied %q, expected %q", src, dst, string(got), want)
 	}
+
+	i, err := os.Stat(dst)
+	if err != nil {
+		t.Errorf("os.Stat(%s) failed unexpectedly with err: %+v", dst, err)
+	}
+
+	if i.Mode().Perm() != 0o644 {
+		t.Errorf("SaferWriteFile(%s) set incorrect permissions, os.Stat(%s) = %o, want %o", dst, dst, i.Mode().Perm(), 0o644)
+	}
 }
 
 func TestCopyFileError(t *testing.T) {
@@ -176,7 +206,7 @@ func TestCopyFileError(t *testing.T) {
 	dst := filepath.Join(tmp, "dst")
 	src := filepath.Join(tmp, "src")
 
-	if err := CopyFile(src, dst); err == nil {
+	if err := CopyFile(src, dst, 0644); err == nil {
 		t.Errorf("CopyFile(%s, %s) succeeded for non-existent file, want error", src, dst)
 	}
 }

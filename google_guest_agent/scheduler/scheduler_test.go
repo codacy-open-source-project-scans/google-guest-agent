@@ -1,16 +1,16 @@
-//  Copyright 2023 Google Inc. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Copyright 2023 Google LLC
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     https://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package scheduler
 
@@ -189,23 +189,23 @@ func (j *testLongJob) ShouldEnable(_ context.Context) bool {
 
 func TestScheduleJobsWait(t *testing.T) {
 	ctx := context.Background()
-	start := time.Now().Second()
+	start := time.Now()
 	ScheduleJobs(ctx, []Job{&testLongJob{id: "job1", sleepFor: time.Second}}, true)
-	end := time.Now().Second()
+	end := time.Now()
 	want := 1
 
-	if got := end - start; got < want {
-		t.Errorf("ScheduleJobs(ctx, job1, true) returned after %d seconds, expected to wait for %d", got, want)
+	if got := end.Sub(start); int(got.Seconds()) < want {
+		t.Errorf("ScheduleJobs(ctx, job1, true) returned after %d seconds, expected to wait for %d", int(got.Seconds()), want)
 	}
 }
 
 func TestScheduleJobsNoWait(t *testing.T) {
 	ctx := context.Background()
-	start := time.Now().Second()
+	start := time.Now()
 	ScheduleJobs(ctx, []Job{&testLongJob{id: "job1", sleepFor: time.Second}}, false)
-	end := time.Now().Second()
+	end := time.Now()
 
-	if got := end - start; got >= 1 {
-		t.Errorf("ScheduleJobs(ctx, job1, true) returned after %d seconds, expected no wait", got)
+	if got := end.Sub(start); got.Seconds() >= 1 {
+		t.Errorf("ScheduleJobs(ctx, job1, true) returned after %f seconds, expected no wait", got.Seconds())
 	}
 }

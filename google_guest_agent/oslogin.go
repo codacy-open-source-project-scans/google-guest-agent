@@ -1,16 +1,16 @@
-//  Copyright 2019 Google Inc. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Copyright 2019 Google LLC
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     https://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package main
 
@@ -23,8 +23,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/cfg"
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/events"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/events/sshtrustedca"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/run"
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/sshca"
 	"github.com/GoogleCloudPlatform/guest-agent/metadata"
 	"github.com/GoogleCloudPlatform/guest-logging-go/logger"
 )
@@ -33,6 +36,7 @@ var (
 	googleComment    = "# Added by Google Compute Engine OS Login."
 	googleBlockStart = "#### Google OS Login control. Do not edit this section. ####"
 	googleBlockEnd   = "#### End Google OS Login control section. ####"
+	trustedCAWatcher events.Watcher
 )
 
 type osloginMgr struct{}
@@ -64,25 +68,49 @@ func getOSLoginEnabled(md *metadata.Descriptor) (bool, bool, bool) {
 	return enable, twofactor, skey
 }
 
-func (o *osloginMgr) diff() bool {
+func enableDisableOSLoginCertAuth(ctx context.Context) error {
+	eventManager := events.Get()
+	osLoginEnabled, _, _ := getOSLoginEnabled(newMetadata)
+	if osLoginEnabled {
+		if trustedCAWatcher == nil {
+			trustedCAWatcher = sshtrustedca.New(sshtrustedca.DefaultPipePath)
+			if err := eventManager.AddWatcher(ctx, trustedCAWatcher); err != nil {
+				return err
+			}
+			sshca.Init()
+		}
+	} else {
+		if trustedCAWatcher != nil {
+			if err := eventManager.RemoveWatcher(ctx, trustedCAWatcher); err != nil {
+				return err
+			}
+			sshca.Close()
+			trustedCAWatcher = nil
+		}
+	}
+
+	return nil
+}
+
+func (o *osloginMgr) Diff(ctx context.Context) (bool, error) {
 	oldEnable, oldTwoFactor, oldSkey := getOSLoginEnabled(oldMetadata)
 	enable, twofactor, skey := getOSLoginEnabled(newMetadata)
 	return oldMetadata.Project.ProjectID == "" ||
 		// True on first run or if any value has changed.
 		(oldTwoFactor != twofactor) ||
 		(oldEnable != enable) ||
-		(oldSkey != skey)
+		(oldSkey != skey), nil
 }
 
-func (o *osloginMgr) timeout() bool {
-	return false
+func (o *osloginMgr) Timeout(ctx context.Context) (bool, error) {
+	return false, nil
 }
 
-func (o *osloginMgr) disabled(os string) bool {
-	return os == "windows"
+func (o *osloginMgr) Disabled(ctx context.Context) (bool, error) {
+	return runtime.GOOS == "windows", nil
 }
 
-func (o *osloginMgr) set(ctx context.Context) error {
+func (o *osloginMgr) Set(ctx context.Context) error {
 	// We need to know if it was previously enabled for the clearing of
 	// metadata-based SSH keys.
 	oldEnable, _, _ := getOSLoginEnabled(oldMetadata)
@@ -92,19 +120,14 @@ func (o *osloginMgr) set(ctx context.Context) error {
 		logger.Infof("Enabling OS Login")
 		newMetadata.Instance.Attributes.SSHKeys = nil
 		newMetadata.Project.Attributes.SSHKeys = nil
-		(&accountsMgr{}).set(ctx)
+		(&accountsMgr{}).Set(ctx)
 	}
 
 	if !enable && oldEnable {
 		logger.Infof("Disabling OS Login")
 	}
 
-	// [Unstable] configuration section has no long term stability or support guarantees/promises.
-	// Configurations defined in the Unstable section will be by default disabled and is intended to
-	// isolate under development features.
-	pamlessAuthStack := config.Section("Unstable").Key("pamless_auth_stack").MustBool(false)
-
-	if err := writeSSHConfig(enable, twofactor, pamlessAuthStack, skey); err != nil {
+	if err := writeSSHConfig(enable, twofactor, skey); err != nil {
 		logger.Errorf("Error updating SSH config: %v.", err)
 	}
 
@@ -112,7 +135,7 @@ func (o *osloginMgr) set(ctx context.Context) error {
 		logger.Errorf("Error updating NSS config: %v.", err)
 	}
 
-	if err := writePAMConfig(enable, twofactor, pamlessAuthStack); err != nil {
+	if err := writePAMConfig(enable, twofactor); err != nil {
 		logger.Errorf("Error updating PAM config: %v.", err)
 	}
 
@@ -192,7 +215,7 @@ func writeConfigFile(path, contents string) error {
 	return nil
 }
 
-func updateSSHConfig(sshConfig string, enable, twofactor, pamlessAuthStack, skey bool) string {
+func updateSSHConfig(sshConfig string, enable, twofactor, skey bool) string {
 	// TODO: this feels like a case for a text/template
 	challengeResponseEnable := "ChallengeResponseAuthentication yes"
 	authorizedKeysCommand := "AuthorizedKeysCommand /usr/bin/google_authorized_keys"
@@ -206,10 +229,10 @@ func updateSSHConfig(sshConfig string, enable, twofactor, pamlessAuthStack, skey
 		}
 	}
 	authorizedKeysUser := "AuthorizedKeysCommandUser root"
-	authorizedPrincipalsCommand := "AuthorizedPrincipalsCommand %u %k"
-	authorizedPrincipalsUser := "AuthorizedPrincipalsCommandUser root"
 
-	// TODO: only enable this key configuration if certs mechanism is enabled
+	// Certificate based authentication.
+	authorizedPrincipalsCommand := "AuthorizedPrincipalsCommand /usr/bin/google_authorized_principals %u %k"
+	authorizedPrincipalsUser := "AuthorizedPrincipalsCommandUser root"
 	trustedUserCAKeys := "TrustedUserCAKeys " + sshtrustedca.DefaultPipePath
 
 	twoFactorAuthMethods := "AuthenticationMethods publickey,keyboard-interactive"
@@ -223,10 +246,13 @@ func updateSSHConfig(sshConfig string, enable, twofactor, pamlessAuthStack, skey
 	filtered := filterGoogleLines(string(sshConfig))
 
 	if enable {
-		osLoginBlock := []string{googleBlockStart, authorizedKeysCommand, authorizedKeysUser, trustedUserCAKeys}
-		if pamlessAuthStack {
-			osLoginBlock = append(osLoginBlock, authorizedPrincipalsCommand, authorizedPrincipalsUser)
+		osLoginBlock := []string{googleBlockStart}
+
+		if cfg.Get().OSLogin.CertAuthentication {
+			osLoginBlock = append(osLoginBlock, trustedUserCAKeys, authorizedPrincipalsCommand, authorizedPrincipalsUser)
 		}
+
+		osLoginBlock = append(osLoginBlock, authorizedKeysCommand, authorizedKeysUser)
 
 		if twofactor {
 			osLoginBlock = append(osLoginBlock, twoFactorAuthMethods, challengeResponseEnable)
@@ -241,12 +267,12 @@ func updateSSHConfig(sshConfig string, enable, twofactor, pamlessAuthStack, skey
 	return strings.Join(filtered, "\n")
 }
 
-func writeSSHConfig(enable, twofactor, pamlessAuthStack, skey bool) error {
+func writeSSHConfig(enable, twofactor, skey bool) error {
 	sshConfig, err := os.ReadFile("/etc/ssh/sshd_config")
 	if err != nil {
 		return err
 	}
-	proposed := updateSSHConfig(string(sshConfig), enable, twofactor, pamlessAuthStack, skey)
+	proposed := updateSSHConfig(string(sshConfig), enable, twofactor, skey)
 	if proposed == string(sshConfig) {
 		return nil
 	}
@@ -312,50 +338,13 @@ func updatePAMsshdPamless(pamsshd string, enable, twofactor bool) string {
 	return strings.Join(filtered, "\n")
 }
 
-// Adds entries to the PAM config for sshd and su which reflect the current
-// enablements. Only writes files if they have changed from what's on disk.
-func updatePAMsshd(pamsshd string, enable, twofactor bool) string {
-	authOSLogin := "auth       [success=done perm_denied=die default=ignore] pam_oslogin_login.so"
-	authGroup := "auth       [default=ignore] pam_group.so"
-	accountOSLogin := "account    [success=ok ignore=ignore default=die] pam_oslogin_login.so"
-	accountOSLoginAdmin := "account    [success=ok default=ignore] pam_oslogin_admin.so"
-	sessionHomeDir := "session    [success=ok default=ignore] pam_mkhomedir.so"
-
-	if runtime.GOOS == "freebsd" {
-		authOSLogin = "auth       optional pam_oslogin_login.so"
-		authGroup = "auth       optional pam_group.so"
-		accountOSLogin = "account    requisite pam_oslogin_login.so"
-		accountOSLoginAdmin = "account    optional pam_oslogin_admin.so"
-		sessionHomeDir = "session    optional pam_mkhomedir.so"
-	}
-
-	filtered := filterGoogleLines(string(pamsshd))
-	if enable {
-		topOfFile := []string{googleBlockStart}
-		if twofactor {
-			topOfFile = append(topOfFile, authOSLogin)
-		}
-		topOfFile = append(topOfFile, authGroup, googleBlockEnd)
-		bottomOfFile := []string{googleBlockStart, accountOSLogin, accountOSLoginAdmin, sessionHomeDir, googleBlockEnd}
-		filtered = append(topOfFile, filtered...)
-		filtered = append(filtered, bottomOfFile...)
-	}
-	return strings.Join(filtered, "\n")
-}
-
-func writePAMConfig(enable, twofactor, pamlessAuthStack bool) error {
+func writePAMConfig(enable, twofactor bool) error {
 	pamsshd, err := os.ReadFile("/etc/pam.d/sshd")
 	if err != nil {
 		return err
 	}
 
-	var proposed string
-	if pamlessAuthStack {
-		proposed = updatePAMsshdPamless(string(pamsshd), enable, twofactor)
-	} else {
-		proposed = updatePAMsshd(string(pamsshd), enable, twofactor)
-	}
-
+	proposed := updatePAMsshdPamless(string(pamsshd), enable, twofactor)
 	if proposed != string(pamsshd) {
 		if err := writeConfigFile("/etc/pam.d/sshd", proposed); err != nil {
 			return err

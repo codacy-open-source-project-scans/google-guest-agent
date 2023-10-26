@@ -1,16 +1,16 @@
-//  Copyright 2017 Google Inc. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Copyright 2017 Google LLC
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     https://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package metadata
 
@@ -53,6 +53,7 @@ var (
 type MDSClientInterface interface {
 	Get(context.Context) (*Descriptor, error)
 	GetKey(context.Context, string, map[string]string) (string, error)
+	GetKeyRecursive(context.Context, string) (string, error)
 	Watch(context.Context) (*Descriptor, error)
 	WriteGuestAttributes(context.Context, string, string) error
 }
@@ -327,6 +328,21 @@ func (c *Client) GetKey(ctx context.Context, key string, headers map[string]stri
 	cfg := requestConfig{
 		baseURL: reqURL,
 		headers: headers,
+	}
+	return c.retry(ctx, cfg)
+}
+
+// GetKeyRecursive gets a specific metadata key recursively and returns JSON output.
+func (c *Client) GetKeyRecursive(ctx context.Context, key string) (string, error) {
+	reqURL, err := url.JoinPath(c.metadataURL, key)
+	if err != nil {
+		return "", fmt.Errorf("failed to form metadata url: %+v", err)
+	}
+
+	cfg := requestConfig{
+		baseURL:    reqURL,
+		jsonOutput: true,
+		recursive:  true,
 	}
 	return c.retry(ctx, cfg)
 }

@@ -1,16 +1,16 @@
-//  Copyright 2019 Google Inc. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Copyright 2019 Google LLC
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     https://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package main
 
@@ -18,26 +18,27 @@ import (
 	"context"
 	"runtime"
 
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/cfg"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/run"
 	"github.com/GoogleCloudPlatform/guest-logging-go/logger"
 )
 
 type clockskewMgr struct{}
 
-func (a *clockskewMgr) diff() bool {
-	return oldMetadata.Instance.VirtualClock.DriftToken != newMetadata.Instance.VirtualClock.DriftToken
+func (a *clockskewMgr) Diff(ctx context.Context) (bool, error) {
+	return oldMetadata.Instance.VirtualClock.DriftToken != newMetadata.Instance.VirtualClock.DriftToken, nil
 }
 
-func (a *clockskewMgr) timeout() bool {
-	return false
+func (a *clockskewMgr) Timeout(ctx context.Context) (bool, error) {
+	return false, nil
 }
 
-func (a *clockskewMgr) disabled(os string) (disabled bool) {
-	enabled := config.Section("Daemons").Key("clock_skew_daemon").MustBool(true)
-	return os == "windows" || !enabled
+func (a *clockskewMgr) Disabled(ctx context.Context) (bool, error) {
+	enabled := cfg.Get().Daemons.ClockSkewDaemon
+	return runtime.GOOS == "windows" || !enabled, nil
 }
 
-func (a *clockskewMgr) set(ctx context.Context) error {
+func (a *clockskewMgr) Set(ctx context.Context) error {
 	if runtime.GOOS == "freebsd" {
 		err := run.Quiet(ctx, "service", "ntpd", "status")
 		if err == nil {

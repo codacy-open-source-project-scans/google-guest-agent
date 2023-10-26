@@ -1,16 +1,16 @@
-//  Copyright 2017 Google Inc. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Copyright 2017 Google LLC
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     https://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package main
 
@@ -28,9 +28,11 @@ import (
 	"hash"
 	"math/big"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 
+	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/cfg"
 	"github.com/GoogleCloudPlatform/guest-agent/metadata"
 	"github.com/GoogleCloudPlatform/guest-agent/utils"
 	"github.com/GoogleCloudPlatform/guest-logging-go/logger"
@@ -220,51 +222,56 @@ func getWinSSHEnabled(md *metadata.Descriptor) bool {
 	return enable
 }
 
-type winAccountsMgr struct{}
+type winAccountsMgr struct {
+	// fakeWindows forces Disabled to run as if it was running in a windows system.
+	// mostly target for unit tests.
+	fakeWindows bool
+}
 
-func (a *winAccountsMgr) diff() bool {
+func (a *winAccountsMgr) Diff(ctx context.Context) (bool, error) {
 	oldSSHEnable := getWinSSHEnabled(oldMetadata)
 
 	sshEnable := getWinSSHEnabled(newMetadata)
 	if sshEnable != oldSSHEnable {
-		return true
+		return true, nil
 	}
 	if !reflect.DeepEqual(newMetadata.Instance.Attributes.WindowsKeys, oldMetadata.Instance.Attributes.WindowsKeys) {
-		return true
+		return true, nil
 	}
 	if !compareStringSlice(newMetadata.Instance.Attributes.SSHKeys, oldMetadata.Instance.Attributes.SSHKeys) {
-		return true
+		return true, nil
 	}
 	if !compareStringSlice(newMetadata.Project.Attributes.SSHKeys, oldMetadata.Project.Attributes.SSHKeys) {
-		return true
+		return true, nil
 	}
 	if newMetadata.Instance.Attributes.BlockProjectKeys != oldMetadata.Instance.Attributes.BlockProjectKeys {
-		return true
+		return true, nil
 	}
 
-	return false
+	return false, nil
 }
 
-func (a *winAccountsMgr) timeout() bool {
-	return false
+func (a *winAccountsMgr) Timeout(ctx context.Context) (bool, error) {
+	return false, nil
 }
 
-func (a *winAccountsMgr) disabled(os string) (disabled bool) {
-	if os != "windows" {
-		return true
+func (a *winAccountsMgr) Disabled(ctx context.Context) (bool, error) {
+	if !a.fakeWindows && runtime.GOOS != "windows" {
+		return true, nil
 	}
 
-	disabled, err := config.Section("accountManager").Key("disable").Bool()
-	if err == nil {
-		return disabled
+	config := cfg.Get()
+	if config.AccountManager != nil {
+		return config.AccountManager.Disable, nil
 	}
+
 	if newMetadata.Instance.Attributes.DisableAccountManager != nil {
-		return *newMetadata.Instance.Attributes.DisableAccountManager
+		return *newMetadata.Instance.Attributes.DisableAccountManager, nil
 	}
 	if newMetadata.Project.Attributes.DisableAccountManager != nil {
-		return *newMetadata.Project.Attributes.DisableAccountManager
+		return *newMetadata.Project.Attributes.DisableAccountManager, nil
 	}
-	return false
+	return false, nil
 }
 
 type versionInfo struct {
@@ -328,7 +335,7 @@ func verifyWinSSHVersion(ctx context.Context) error {
 	return versionOk(sshdVersion, minSSHVersion)
 }
 
-func (a *winAccountsMgr) set(ctx context.Context) error {
+func (a *winAccountsMgr) Set(ctx context.Context) error {
 	oldSSHEnable := getWinSSHEnabled(oldMetadata)
 	sshEnable := getWinSSHEnabled(newMetadata)
 

@@ -1,36 +1,38 @@
-//  Copyright 2017 Google Inc. All Rights Reserved.
-//
-//  Licensed under the Apache License, Version 2.0 (the "License");
-//  you may not use this file except in compliance with the License.
-//  You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//  Unless required by applicable law or agreed to in writing, software
-//  distributed under the License is distributed on an "AS IS" BASIS,
-//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//  See the License for the specific language governing permissions and
-//  limitations under the License.
+// Copyright 2017 Google LLC
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     https://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/base64"
+	"fmt"
 	"hash"
 	"math/big"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 	"unicode"
 
 	"github.com/GoogleCloudPlatform/guest-agent/metadata"
 	"github.com/GoogleCloudPlatform/guest-agent/utils"
-	"github.com/go-ini/ini"
 )
 
 func mkptr(b bool) *bool {
@@ -77,23 +79,34 @@ func TestAccountsDisabled(t *testing.T) {
 		{"disabled in project metadata only", []byte(""), &metadata.Descriptor{Project: metadata.Project{Attributes: metadata.Attributes{DisableAccountManager: mkptr(true)}}}, true},
 	}
 
+	ctx := context.Background()
 	for _, tt := range tests {
-		cfg, err := ini.InsensitiveLoad(tt.data)
-		if err != nil {
-			t.Errorf("test case %q: error parsing config: %v", tt.name, err)
-			continue
-		}
-		if cfg == nil {
-			cfg = &ini.File{}
-		}
-		newMetadata = tt.md
-		config = cfg
-		got := (&winAccountsMgr{}).disabled("windows")
-		if got != tt.want {
-			t.Errorf("test case %q, accounts.disabled() got: %t, want: %t", tt.name, got, tt.want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			reloadConfig(t, tt.data)
+
+			newMetadata = tt.md
+			mgr := &winAccountsMgr{
+				fakeWindows: true,
+			}
+
+			got, err := mgr.Disabled(ctx)
+			if err != nil {
+				t.Errorf("Failed to run winAccountsMgr's Disabled() call: %+v", err)
+			}
+
+			if got != tt.want {
+				t.Errorf("accounts.disabled() got: %t, want: %t", got, tt.want)
+			}
+		})
 	}
-	got := (&winAccountsMgr{}).disabled("linux")
+
+	reloadConfig(t, nil)
+
+	got, err := (&winAccountsMgr{}).Disabled(ctx)
+	if err != nil {
+		t.Errorf("Failed to run winAccountsMgr's Disabled() call: %+v", err)
+	}
+
 	if got != true {
 		t.Errorf("winAccountsMgr.disabled(\"linux\") got: %t, want: true", got)
 	}
@@ -221,41 +234,43 @@ func TestCompareAccounts(t *testing.T) {
 }
 
 func TestGetUserKeys(t *testing.T) {
+	pubKey := utils.MakeRandRSAPubKey(t)
+
 	var tests = []struct {
 		key           string
 		expectedValid int
 	}{
-		{`user:ssh-rsa [KEY] google-ssh {"userName":"user@email.com", "expireOn":"2028-11-08T19:30:47+0000"}`,
+		{fmt.Sprintf(`user:ssh-rsa %s google-ssh {"userName":"user@email.com", "expireOn":"2028-11-08T19:30:47+0000"}`, pubKey),
 			1,
 		},
-		{`user:ssh-rsa [KEY] google-ssh {"userName":"user@email.com", "expireOn":"2028-11-08T19:30:47+0700"}`,
+		{fmt.Sprintf(`user:ssh-rsa %s google-ssh {"userName":"user@email.com", "expireOn":"2028-11-08T19:30:47+0700"}`, pubKey),
 			1,
 		},
-		{`user:ssh-rsa [KEY] google-ssh {"userName":"user@email.com", "expireOn":"2028-11-08T19:30:47+0700", "futureField": "UNUSED_FIELDS_IGNORED"}`,
+		{fmt.Sprintf(`user:ssh-rsa %s google-ssh {"userName":"user@email.com", "expireOn":"2028-11-08T19:30:47+0700", "futureField": "UNUSED_FIELDS_IGNORED"}`, pubKey),
 			1,
 		},
-		{`user:ssh-rsa [KEY] google-ssh {"userName":"user@email.com", "expireOn":"2018-11-08T19:30:46+0000"}`,
+		{fmt.Sprintf(`user:ssh-rsa %s google-ssh {"userName":"user@email.com", "expireOn":"2018-11-08T19:30:46+0000"}`, pubKey),
 			0,
 		},
-		{`user:ssh-rsa [KEY] google-ssh {"userName":"user@email.com", "expireOn":"2018-11-08T19:30:46+0700"}`,
+		{fmt.Sprintf(`user:ssh-rsa %s google-ssh {"userName":"user@email.com", "expireOn":"2018-11-08T19:30:46+0700"}`, pubKey),
 			0,
 		},
-		{`user:ssh-rsa [KEY] google-ssh {"userName":"user@email.com", "expireOn":"INVALID_TIMESTAMP"}`,
+		{fmt.Sprintf(`user:ssh-rsa %s google-ssh {"userName":"user@email.com", "expireOn":"INVALID_TIMESTAMP"}`, pubKey),
 			0,
 		},
-		{`user:ssh-rsa [KEY] google-ssh`,
+		{fmt.Sprintf(`user:ssh-rsa %s google-ssh`, pubKey),
 			0,
 		},
-		{`user:ssh-rsa [KEY] user`,
+		{fmt.Sprintf(`user:ssh-rsa %s user`, pubKey),
 			1,
 		},
-		{`user:ssh-rsa [KEY]`,
+		{fmt.Sprintf(`user:ssh-rsa %s`, pubKey),
 			1,
 		},
-		{`malformed-ssh-keys [KEY] google-ssh`,
+		{fmt.Sprintf(`malformed-ssh-keys %s google-ssh`, pubKey),
 			0,
 		},
-		{`:malformed-ssh-keys [KEY] google-ssh`,
+		{fmt.Sprintf(`:malformed-ssh-keys %s google-ssh`, pubKey),
 			0,
 		},
 	}
@@ -269,6 +284,8 @@ func TestGetUserKeys(t *testing.T) {
 }
 
 func TestRemoveExpiredKeys(t *testing.T) {
+	randKey := utils.MakeRandRSAPubKey(t)
+
 	var tests = []struct {
 		key   string
 		valid bool
@@ -296,14 +313,15 @@ func TestRemoveExpiredKeys(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		ret := removeExpiredKeys([]string{tt.key})
+		currentKey := strings.Replace(tt.key, "[KEY]", randKey, 1)
+		ret := removeExpiredKeys([]string{currentKey})
 		if tt.valid {
-			if len(ret) == 0 || ret[0] != tt.key {
-				t.Errorf("valid key was removed: %q", tt.key)
+			if len(ret) == 0 || ret[0] != currentKey {
+				t.Errorf("valid key was removed: %q", currentKey)
 			}
 		}
 		if !tt.valid && len(ret) == 1 {
-			t.Errorf("invalid key was kept: %q", tt.key)
+			t.Errorf("invalid key was kept: %q", currentKey)
 		}
 	}
 }
