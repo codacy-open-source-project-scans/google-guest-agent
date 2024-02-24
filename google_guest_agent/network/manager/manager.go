@@ -25,7 +25,6 @@ import (
 
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/cfg"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/osinfo"
-	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/run"
 	"github.com/GoogleCloudPlatform/guest-agent/metadata"
 	"github.com/GoogleCloudPlatform/guest-logging-go/logger"
 )
@@ -72,11 +71,6 @@ type osConfigAction struct {
 	// enables/disables OS management of the provided nics.
 	// NOTE: This will eventually be moved to the specific network manager implementation.
 	nativeOSConfig func(ctx context.Context, nic []string) error
-
-	// ignoreSetup indicates whether to ignore the rest of the network management setup.
-	// This is used with nativeOSConfig to determine if, after running the function, the
-	// agent should continue with the rest of the setup.
-	ignoreSetup bool
 }
 
 const (
@@ -136,17 +130,7 @@ var (
 				nativeOSConfig: rhelNativeOSConfig,
 			},
 		},
-		// SUSE rules
-		{
-			osNames: []string{"sles"},
-			majorVersions: map[int]bool{
-				osConfigRuleAnyVersion: true,
-			},
-			action: osConfigAction{
-				nativeOSConfig: slesNativeOSConfig,
-				ignoreSetup:    true,
-			},
-		},
+		// Ubuntu rules
 		{
 			osNames: []string{"ubuntu"},
 			majorVersions: map[int]bool{
@@ -264,10 +248,6 @@ func SetupInterfaces(ctx context.Context, config *cfg.Sections, nics []metadata.
 		if err = osRule.action.nativeOSConfig(ctx, interfaces); err != nil {
 			return fmt.Errorf("failed to disable OS nic management: %v", err)
 		}
-		// Don't run setup.
-		if osRule.action.ignoreSetup {
-			return nil
-		}
 	}
 
 	// Get the network manager.
@@ -288,41 +268,6 @@ func SetupInterfaces(ctx context.Context, config *cfg.Sections, nics []metadata.
 		return fmt.Errorf("error setting up %s: %v", nm.Name(), err)
 	}
 	return nil
-}
-
-// slesNativeOSConfig writes on ifcfg file for each interface, then runs
-// `wicked ifup eth1 ... ethN`
-// NOTE: May remove entirely later on due to default configurations.
-func slesNativeOSConfig(ctx context.Context, interfaces []string) error {
-	var err error
-	var priority = 10100
-	for _, iface := range interfaces {
-		logger.Debugf("write enabling ifcfg-%s config", iface)
-
-		var ifcfg *os.File
-		ifcfg, err = os.Create("/etc/sysconfig/network/ifcfg-" + iface)
-		if err != nil {
-			return err
-		}
-		defer ifcfg.Close()
-
-		contents := []string{
-			googleComment,
-			"STARTMODE=hotplug",
-			// NOTE: 'dhcp' is the dhcp4+dhcp6 option.
-			"BOOTPROTO=dhcp",
-			fmt.Sprintf("DHCLIENT_ROUTE_PRIORITY=%d", priority),
-		}
-
-		_, err = ifcfg.WriteString(strings.Join(contents, "\n"))
-		if err != nil {
-			return err
-		}
-
-		priority += 100
-	}
-	args := append([]string{"ifup", "--timeout", "1"}, interfaces...)
-	return run.Quiet(ctx, "/usr/sbin/wicked", args...)
 }
 
 // rhelNativeOSConfig writes an ifcfg file with DHCP and NetworkManager disabled
