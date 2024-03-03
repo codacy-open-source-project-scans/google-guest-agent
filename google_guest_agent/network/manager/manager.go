@@ -19,9 +19,7 @@ package manager
 import (
 	"context"
 	"fmt"
-	"os"
 	"slices"
-	"strings"
 
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/cfg"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/osinfo"
@@ -32,18 +30,35 @@ import (
 // Service is an interface for setting up network configurations
 // using different network managing services, such as systemd-networkd and wicked.
 type Service interface {
+	// Configure gives the opportunity for the Service implementation to adjust its configuration
+	// based on the Guest Agent configuration.
+	Configure(ctx context.Context, config *cfg.Sections)
+
 	// IsManaging checks whether this network manager service is managing the provided interface.
 	IsManaging(ctx context.Context, iface string) (bool, error)
 
 	// Name is the name of the network manager service.
 	Name() string
 
-	// Setup writes the appropriate configurations for the network manager service for all
+	// SetupEthernetInterface writes the appropriate configurations for the network manager service for all
 	// non-primary network interfaces.
-	Setup(ctx context.Context, config *cfg.Sections, payload []metadata.NetworkInterfaces) error
+	SetupEthernetInterface(ctx context.Context, config *cfg.Sections, nics *Interfaces) error
+
+	// SetupVlanInterface writes the apppropriate vLAN interfaces configuration for the network manager service
+	// for all configured interfaces.
+	SetupVlanInterface(ctx context.Context, config *cfg.Sections, nics *Interfaces) error
 
 	// Rollback rolls back the changes created in Setup.
-	Rollback(ctx context.Context, payload []metadata.NetworkInterfaces) error
+	Rollback(ctx context.Context, nics *Interfaces) error
+}
+
+// Interfaces wraps both ethernet and vlan interfaces.
+type Interfaces struct {
+	// EthernetInterfaces are the regular ethernet interfaces descriptors offered by metadata.
+	EthernetInterfaces []metadata.NetworkInterfaces
+
+	// VlanInterfaces are the vLAN interfaces descriptors offered by metadata.
+	VlanInterfaces map[int]metadata.VlanInterface
 }
 
 // osConfigRule describes matching rules for OS's, used for specifying either
@@ -66,18 +81,17 @@ type osConfigAction struct {
 
 	// ignoreSecondary determines whether to ignore all non-primary network interfaces.
 	ignoreSecondary bool
+}
 
-	// nativeOSConfig is a function pointer to the specific implementation that
-	// enables/disables OS management of the provided nics.
-	// NOTE: This will eventually be moved to the specific network manager implementation.
-	nativeOSConfig func(ctx context.Context, nic []string) error
+// guestAgentSection is the section added to guest-agent-written ini files to indicate
+// that the ini file is managed by the agent.
+type guestAgentSection struct {
+	// Managed indicates whether this ini file is managed by the agent.
+	Managed bool
 }
 
 const (
 	googleComment = "# Added by Google Compute Engine Guest Agent."
-
-	// osConfigRuleAnyVersion applies a rule for any version of an OS.
-	osConfigRuleAnyVersion = -1
 )
 
 var (
@@ -119,15 +133,6 @@ var (
 			},
 			action: osConfigAction{
 				ignorePrimary: true,
-			},
-		},
-		{
-			osNames: []string{"rhel", "centos", "rocky"},
-			majorVersions: map[int]bool{
-				osConfigRuleAnyVersion: true,
-			},
-			action: osConfigAction{
-				nativeOSConfig: rhelNativeOSConfig,
 			},
 		},
 		// Ubuntu rules
@@ -193,18 +198,14 @@ func detectNetworkManager(ctx context.Context, iface string) (Service, error) {
 }
 
 // findOSRule finds the osConfigRule that applies to the current system.
-func findOSRule(broadVersion bool) *osConfigRule {
+func findOSRule() *osConfigRule {
 	osInfo := osinfoGet()
 	for _, curr := range osRules {
 		if !slices.Contains(curr.osNames, osInfo.OS) {
 			continue
 		}
 
-		if broadVersion && curr.majorVersions[osConfigRuleAnyVersion] {
-			return &curr
-		}
-
-		if !broadVersion && curr.majorVersions[osInfo.Version.Major] {
+		if curr.majorVersions[osInfo.Version.Major] {
 			return &curr
 		}
 	}
@@ -214,7 +215,7 @@ func findOSRule(broadVersion bool) *osConfigRule {
 // shouldManageInterface returns whether the guest agent should manage an interface
 // provided whether the interface of interest is the primary interface or not.
 func shouldManageInterface(isPrimary bool) bool {
-	rule := findOSRule(false)
+	rule := findOSRule()
 	if rule != nil {
 		if isPrimary {
 			return !rule.action.ignorePrimary
@@ -228,27 +229,29 @@ func shouldManageInterface(isPrimary bool) bool {
 // SetupInterfaces sets up all the network interfaces on the system, applying rules described
 // by osRules and using the native network manager service detected to be managing the primary
 // network interface.
-func SetupInterfaces(ctx context.Context, config *cfg.Sections, nics []metadata.NetworkInterfaces) error {
+func SetupInterfaces(ctx context.Context, config *cfg.Sections, mds *metadata.Descriptor) error {
 	// User may have disabled network interface setup entirely.
 	if !config.NetworkInterfaces.Setup {
-		logger.Infof("network interface setup disabled, skipping...")
+		logger.Infof("Network interface setup disabled, skipping...")
 		return nil
 	}
 
-	interfaces, err := interfaceNames(nics)
+	nics := &Interfaces{
+		EthernetInterfaces: mds.Instance.NetworkInterfaces,
+		VlanInterfaces:     map[int]metadata.VlanInterface{},
+	}
+
+	for _, curr := range mds.Instance.VlanNetworkInterfaces {
+		for key, val := range curr {
+			nics.VlanInterfaces[key] = val
+		}
+	}
+
+	interfaces, err := interfaceNames(nics.EthernetInterfaces)
 	if err != nil {
 		return fmt.Errorf("error getting interface names: %v", err)
 	}
 	primaryInterface := interfaces[0]
-
-	// Apply the OS-specific rules.
-	osRule := findOSRule(true)
-	if osRule != nil && osRule.action.nativeOSConfig != nil {
-		logger.Infof("Found OS config rule. Running...")
-		if err = osRule.action.nativeOSConfig(ctx, interfaces); err != nil {
-			return fmt.Errorf("failed to disable OS nic management: %v", err)
-		}
-	}
 
 	// Get the network manager.
 	nm, err := detectNetworkManager(ctx, primaryInterface)
@@ -256,52 +259,30 @@ func SetupInterfaces(ctx context.Context, config *cfg.Sections, nics []metadata.
 		return fmt.Errorf("error detecting network manager service: %v", err)
 	}
 
+	nm.Configure(ctx, config)
+
 	// Since the manager is different, undo all the changes of the old manager.
 	if currManager != nil && nm != currManager {
+		logger.Infof("Rolling back %s", currManager.Name())
 		if err = currManager.Rollback(ctx, nics); err != nil {
 			return fmt.Errorf("error rolling back config for %s: %v", currManager.Name(), err)
 		}
 	}
 
 	currManager = nm
-	if err = nm.Setup(ctx, config, nics); err != nil {
-		return fmt.Errorf("error setting up %s: %v", nm.Name(), err)
-	}
-	return nil
-}
 
-// rhelNativeOSConfig writes an ifcfg file with DHCP and NetworkManager disabled
-// to all secondary nics.
-func rhelNativeOSConfig(ctx context.Context, interfaces []string) error {
-	for _, curr := range interfaces[1:] {
-		if err := writeRHELIfcfg(curr); err != nil {
-			return err
+	logger.Infof("Setting up %s", nm.Name())
+	if err = nm.SetupEthernetInterface(ctx, config, nics); err != nil {
+		return fmt.Errorf("manager(%s): error setting up ethernet interfaces: %v", nm.Name(), err)
+	}
+
+	if config.Unstable.VlanSetupEnabled {
+		if err = nm.SetupVlanInterface(ctx, config, nics); err != nil {
+			return fmt.Errorf("manager(%s): error setting up vlan interfaces: %v", nm.Name(), err)
 		}
 	}
-	return nil
-}
 
-// writeRHELIfcfg writes the ifcfg file for the specified interface.
-func writeRHELIfcfg(iface string) error {
-	logger.Debugf("write disabling ifcfg-%s config", iface)
-	filename := "/etc/sysconfig/network-scripts/ifcfg-" + iface
-	ifcfg, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
-	if err == nil {
-		defer ifcfg.Close()
-		contents := []string{
-			googleComment,
-			fmt.Sprintf("DEVICE=%s", iface),
-			"BOOTPROTO=none",
-			"DEFROUTE=no",
-			"IPV6INIT=no",
-			"NM_CONTROLLED=no",
-			"NOZEROCONF=yes",
-		}
-		_, err = ifcfg.WriteString(strings.Join(contents, "\n"))
-		return err
-	}
-	if os.IsExist(err) {
-		return nil
-	}
-	return err
+	logger.Infof("Finished setting up %s", nm.Name())
+
+	return nil
 }

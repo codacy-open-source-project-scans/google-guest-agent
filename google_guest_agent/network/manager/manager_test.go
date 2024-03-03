@@ -23,7 +23,6 @@ import (
 
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/cfg"
 	"github.com/GoogleCloudPlatform/guest-agent/google_guest_agent/osinfo"
-	"github.com/GoogleCloudPlatform/guest-agent/metadata"
 )
 
 const (
@@ -51,6 +50,11 @@ func (n mockService) Name() string {
 	return "service"
 }
 
+// Configure gives the opportunity for the Service implementation to adjust its configuration
+// based on the Guest Agent configuration.
+func (n mockService) Configure(ctx context.Context, config *cfg.Sections) {
+}
+
 // IsManaging implements the Service interface.
 func (n mockService) IsManaging(ctx context.Context, iface string) (bool, error) {
 	if n.managingError {
@@ -59,13 +63,18 @@ func (n mockService) IsManaging(ctx context.Context, iface string) (bool, error)
 	return n.isManaging, nil
 }
 
-// Setup implements the Service interface.
-func (n mockService) Setup(ctx context.Context, config *cfg.Sections, payload []metadata.NetworkInterfaces) error {
+// SetupEthernetInterface implements the Service interface.
+func (n mockService) SetupEthernetInterface(ctx context.Context, config *cfg.Sections, nics *Interfaces) error {
+	return nil
+}
+
+// SetupVlanInterface implements the Service interface.
+func (n mockService) SetupVlanInterface(ctx context.Context, config *cfg.Sections, nics *Interfaces) error {
 	return nil
 }
 
 // Rollback implements the Service interface.
-func (n mockService) Rollback(ctx context.Context, payload []metadata.NetworkInterfaces) error {
+func (n mockService) Rollback(ctx context.Context, nics *Interfaces) error {
 	return nil
 }
 
@@ -234,9 +243,6 @@ func TestFindOSRule(t *testing.T) {
 		// rules are mock OSConfig rules.
 		rules []osConfigRule
 
-		// broadVersion indicates whether to call findOSRule() using broad versions.
-		broadVersion bool
-
 		// expectedNil indicates to expect a nil return when set to true.
 		expectedNil bool
 	}{
@@ -252,23 +258,7 @@ func TestFindOSRule(t *testing.T) {
 					action: osConfigAction{},
 				},
 			},
-			broadVersion: false,
-			expectedNil:  false,
-		},
-		// ignoreRule broad version exists.
-		{
-			name: "ignore-exist-broad",
-			rules: []osConfigRule{
-				{
-					osNames: []string{"test"},
-					majorVersions: map[int]bool{
-						osConfigRuleAnyVersion: true,
-					},
-					action: osConfigAction{},
-				},
-			},
-			broadVersion: true,
-			expectedNil:  false,
+			expectedNil: false,
 		},
 		// ignoreRule does not exist.
 		{
@@ -282,53 +272,7 @@ func TestFindOSRule(t *testing.T) {
 					action: osConfigAction{},
 				},
 			},
-			broadVersion: false,
-			expectedNil:  true,
-		},
-		// ignoreRule broadVersion does not exist.
-		{
-			name: "ignore-no-exist-broad",
-			rules: []osConfigRule{
-				{
-					osNames: []string{"non-test"},
-					majorVersions: map[int]bool{
-						osConfigRuleAnyVersion: true,
-					},
-					action: osConfigAction{},
-				},
-			},
-			broadVersion: true,
-			expectedNil:  true,
-		},
-		// ignoreRule non-broadVersion exists, but we want broad version.
-		{
-			name: "ignore-no-exist-broad-nonbroad-exist",
-			rules: []osConfigRule{
-				{
-					osNames: []string{"test"},
-					majorVersions: map[int]bool{
-						testOSVersion: true,
-					},
-					action: osConfigAction{},
-				},
-			},
-			broadVersion: true,
-			expectedNil:  true,
-		},
-		// ignoreRule broadVersion exists, but we want non-broad version.
-		{
-			name: "ignore-no-exist-broad-exist",
-			rules: []osConfigRule{
-				{
-					osNames: []string{"test"},
-					majorVersions: map[int]bool{
-						osConfigRuleAnyVersion: true,
-					},
-					action: osConfigAction{},
-				},
-			},
-			broadVersion: false,
-			expectedNil:  true,
+			expectedNil: true,
 		},
 	}
 
@@ -338,7 +282,7 @@ func TestFindOSRule(t *testing.T) {
 			managerTestSetup()
 
 			osRules = test.rules
-			osRule := findOSRule(test.broadVersion)
+			osRule := findOSRule()
 
 			if osRule == nil && !test.expectedNil {
 				t.Errorf("findOSRule() returned nil when non-nil expected")
