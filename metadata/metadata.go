@@ -240,7 +240,7 @@ func (a *Attributes) UnmarshalJSON(b []byte) error {
 		SSHKeys               string      `json:"ssh-keys"`
 		TwoFactor             string      `json:"enable-oslogin-2fa"`
 		SecurityKey           string      `json:"enable-oslogin-sk"`
-		RequireCerts          string      `json:"require-oslogin-certificates"`
+		RequireCerts          string      `json:"enable-oslogin-certificates"`
 		WindowsKeys           WindowsKeys `json:"windows-keys"`
 		WSFCAddresses         string      `json:"wsfc-addrs"`
 		WSFCAgentPort         string      `json:"wsfc-agent-port"`
@@ -506,10 +506,15 @@ func (c *Client) do(ctx context.Context, cfg requestConfig) (*http.Response, err
 		return resp, fmt.Errorf("error connecting to metadata server: %+v", err)
 	}
 
-	statusCodeMsg := "error connecting to metadata server, status code: %d"
-	switch resp.StatusCode {
-	case 404, 412:
-		return resp, fmt.Errorf(statusCodeMsg, resp.StatusCode)
+	if resp == nil {
+		return nil, fmt.Errorf("got nil response from metadata server")
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		// Ignore read error as we are returning original error and wrapping MDS error code.
+		r, _ := io.ReadAll(resp.Body)
+		return resp, fmt.Errorf("invalid response from metadata server, status code: %d, reason: %s", resp.StatusCode, string(r))
 	}
 
 	if cfg.hang {
